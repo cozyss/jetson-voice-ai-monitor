@@ -1,6 +1,9 @@
-# Runtime is intentionally stdlib-only for the daemon/dashboard.
+# Core daemon/dashboard are stdlib-first; W&B is optional telemetry for hackathon tracing.
 # External binaries used by scripts:
 # - whisper.cpp whisper-cli
 # - llama.cpp llama-server
 # - Piper TTS
 # - ALSA arecord/aplay
+
+# Optional: enable VOICE_WANDB_ENABLED=1 for hackathon telemetry/tracing.
+wandb>=0.17

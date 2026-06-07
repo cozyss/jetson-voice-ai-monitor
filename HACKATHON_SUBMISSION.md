@@ -33,6 +33,13 @@ The demo is not just "LLM on edge." It adds a practical self-improvement loop fo
 - Piper TTS
 - Python daemon and local dashboard
 
+
+## Telemetry and developer workflow
+
+For hackathon review, the system integrates optional **Weights & Biases telemetry**. When enabled, the daemon logs trace events for the local tutoring loop and the self-improvement loop: Q&A saved, weak-answer counts, online review status, and knowledge-base enrichment progress. This makes the demo auditable: judges can see how an offline question becomes an online review and then a local KB improvement.
+
+The build process used **Cursor** for fast code iteration and repository editing, and **OpenAI** for implementation planning, product framing, and README/report drafting. These tools helped move quickly while keeping the shipped runtime focused on local Jetson inference and explicit, opt-in online enrichment.
+
 ## Current status
 
 Working prototype code is packaged in this repo. Runtime logs, recordings, API keys, generated queue data, and model weights are excluded. Example JSON files document the review queue and local KB shapes.

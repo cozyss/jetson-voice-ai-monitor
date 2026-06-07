@@ -34,6 +34,17 @@ The self-improvement loop is intentionally narrow and reviewable:
 
 It does **not** automatically fine-tune model weights or rewrite arbitrary code. The self-improvement target is the local educational knowledge base.
 
+
+## Hackathon tracing and build workflow
+
+For the hackathon demo, the repo includes optional **Weights & Biases telemetry** support. When `VOICE_WANDB_ENABLED=1` and `WANDB_API_KEY` is configured, daemon events are mirrored to W&B so reviewers can trace the learning loop: local question, local answer, saved Q&A, weak-answer counts, Internet God review status, and KB enrichment progress. Telemetry is opt-in because the default deployment goal is privacy-preserving offline learning.
+
+The project was also built with an AI-native developer workflow:
+
+- **Cursor** was used as the coding environment for rapid iteration, refactors, and repo packaging.
+- **OpenAI models** supported product reasoning, implementation planning, README/report drafting, and review of the hackathon narrative.
+- **Weights & Biases** provides observability for the demo traces, making the self-improvement loop visible rather than a black box.
+
 ## Demo behavior
 
 Current repo code mirrors the live Jetson demo:
@@ -48,6 +59,7 @@ Current repo code mirrors the live Jetson demo:
 - Optional nonsense/noise input filter with `nonsense_inputs.json` for demo cleanup.
 - Local KB enrichment file in `knowledge_base/kb_items.json`.
 - Dashboard view for live status, transcript, local answer, saved Q&A, online judgments, KB items, and delete/reset controls.
+- Optional W&B telemetry/tracing for hackathon observability when explicitly enabled.
 
 Runtime queues, recordings, logs, generated KB artifacts, API keys, and model weights are ignored by git. Example JSON structures live in [`examples/`](examples/).
 

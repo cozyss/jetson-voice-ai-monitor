@@ -111,6 +111,14 @@ ANSWER_QUALITY_THRESHOLD = float(os.environ.get('VOICE_ANSWER_QUALITY_THRESHOLD'
 WEAK_ANSWER_MAX_ITEMS = int(os.environ.get('VOICE_WEAK_ANSWER_MAX_ITEMS', '200'))
 CONNECTIVITY_MODE = os.environ.get('VOICE_CONNECTIVITY_MODE', 'connect_to_internet_demo')
 
+# Optional hackathon telemetry/tracing. Disabled by default so offline deployments stay
+# local-only unless the operator explicitly opts in with a W&B API key/environment.
+WANDB_TELEMETRY_ENABLED = os.environ.get('VOICE_WANDB_ENABLED', '0') != '0'
+WANDB_PROJECT = os.environ.get('WANDB_PROJECT', 'self-improving-jetson-tutor')
+WANDB_RUN_NAME = os.environ.get('WANDB_RUN_NAME', 'jetson-tutor-demo')
+WANDB_MAX_CHARS = int(os.environ.get('VOICE_WANDB_MAX_CHARS', '1200'))
+_wandb_run = None
+
 os.makedirs(AUDIO_DIR, exist_ok=True)
 os.makedirs(KB_DIR, exist_ok=True)
 lock = threading.RLock()
@@ -182,10 +190,43 @@ def save_state():
     with open(tmp, 'w') as f: json.dump(state, f, indent=2)
     os.replace(tmp, STATE)
 
+def _wandb_trim(value, max_chars=WANDB_MAX_CHARS):
+    if isinstance(value, str):
+        return value if len(value) <= max_chars else value[:max_chars] + '…'
+    if isinstance(value, dict):
+        return {str(k)[:80]: _wandb_trim(v, max_chars) for k, v in list(value.items())[:40]}
+    if isinstance(value, list):
+        return [_wandb_trim(v, max_chars) for v in value[:20]]
+    return value
+
+def trace_event(kind, payload=None):
+    """Optionally mirror daemon events to Weights & Biases for hackathon traces."""
+    global _wandb_run
+    if not WANDB_TELEMETRY_ENABLED:
+        return
+    try:
+        import wandb  # optional dependency
+        if _wandb_run is None:
+            _wandb_run = wandb.init(project=WANDB_PROJECT, name=WANDB_RUN_NAME, reinit=False)
+        safe_payload = _wandb_trim(payload or {})
+        wandb.log({
+            'event_kind': kind,
+            'event_payload': json.dumps(safe_payload, ensure_ascii=False)[:WANDB_MAX_CHARS],
+            'event_ts': now(),
+            'status': state.get('status', ''),
+            'qa_review_count': state.get('qa_review_count', 0),
+            'weak_answer_count': state.get('weak_answer_count', 0),
+            'kb_item_count': state.get('kb_item_count', 0),
+        })
+    except Exception:
+        # Telemetry must never break offline tutoring.
+        return
+
 def log_event(kind, message, **extra):
     rec = {'ts': now(), 'kind': kind, 'message': message}
     rec.update(extra)
     with open(EVENTS, 'a') as f: f.write(json.dumps(rec) + '\n')
+    trace_event(kind, rec)
     with lock:
         state['last_event'] = rec
         save_state()
