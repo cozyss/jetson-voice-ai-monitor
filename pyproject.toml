@@ -1,12 +1,12 @@
 [project]
 name = "jetson-voice-ai-monitor"
 version = "0.1.0"
-description = "Offline-first voice AI monitor for NVIDIA Jetson: press-to-talk audio, Whisper STT, local Qwen via llama.cpp, Piper TTS, and a live dashboard."
+description = "Offline-first self-improving Jetson tutor: local voice Q&A with Qwen, weak-answer judgment, and knowledge-base enrichment when online."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "cozyss"}]
-keywords = ["jetson", "voice-ai", "qwen", "whisper", "piper", "llama.cpp", "edge-ai", "hackathon"]
+keywords = ["jetson", "offline-education", "tutor", "qwen", "whisper", "piper", "llama.cpp", "edge-ai", "hackathon"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",

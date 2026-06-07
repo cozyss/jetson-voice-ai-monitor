@@ -1,22 +1,25 @@
 # Hackathon submission draft
 
 ## Project name
-Jetson Voice AI Monitor
+Self-improving Jetson Tutor
 
 ## Short description
-An offline-first voice AI companion running on an NVIDIA Jetson: press-to-talk audio capture, Whisper speech-to-text, local Qwen reasoning through llama.cpp CUDA/Flash Attention, Piper text-to-speech, tool calling, and a live web dashboard that shows the full decision pipeline.
+An offline-first voice tutor on NVIDIA Jetson for students without reliable internet access. It uses local Whisper, Qwen, llama.cpp CUDA/Flash Attention, and Piper TTS to answer questions offline, judges whether each answer was good enough, queues weakly answered questions, and later enriches its local educational knowledge base when internet access returns.
 
 ## What it does
-- Turns a Jetson + USB speakerphone into a local voice AI agent.
+- Helps Afghan girls continue learning on a local Jetson device even when internet access is unavailable.
+- Turns a Jetson + USB speakerphone into a local voice tutor.
 - Uses hardware/media keys for push-to-talk recording.
-- Transcribes voice locally with whisper.cpp.
-- Routes requests through a transparent system judge: answer locally, use a local tool, or queue a self-improvement request.
+- Transcribes student questions locally with whisper.cpp.
 - Answers with a local Qwen GGUF model served by llama.cpp on Jetson GPU.
-- Speaks responses with Piper TTS using separate voices for system/tool status and final Qwen answers.
-- Provides a live dashboard for transcripts, routing decisions, tool calls, weak-answer/self-improvement queue, and runtime state.
+- Asks the local model to judge whether the answer was complete, grounded, and useful.
+- Saves questions that were not answered well to a weak-answer/self-improvement queue.
+- When internet is available, reviews the queue and creates a self-improvement request to download/enrich the local knowledge base.
+- Limits self-improvement scope to the educational knowledge base, not unrestricted code or model-weight changes.
+- Speaks responses with Piper TTS and exposes a live dashboard for transcripts, routing decisions, tool calls, weak-answer queue, and runtime state.
 
 ## Why it matters
-Most voice assistants depend on cloud services. This project demonstrates a privacy-preserving edge AI architecture where audio, transcripts, and reasoning can stay on the device, while still exposing enough telemetry to debug and improve the assistant.
+Many students cannot depend on continuous internet access. For Afghan girls facing severe barriers to education, an offline tutor can preserve access to learning material and personalized explanations. This project demonstrates a practical edge-AI pattern: keep tutoring private and local during offline use, then use occasional connectivity to improve the local knowledge base based on the actual questions students asked.
 
 ## Built with
 NVIDIA Jetson Orin, Ubuntu/L4T, CUDA, llama.cpp, Qwen GGUF, whisper.cpp, Piper TTS, ALSA, Python stdlib HTTP server.
@@ -28,6 +31,14 @@ The working prototype ran on a Jetson Orin-class device with:
 - Piper voices for local TTS.
 - EMEET OfficeCore USB speakerphone for capture/playback.
 - Live browser dashboard exposed from the Jetson.
+
+## Self-improvement loop
+1. Student asks a question offline.
+2. Qwen answers using local model + local knowledge base.
+3. Qwen judges its own answer quality.
+4. If weak, the system records the question and why the answer was insufficient.
+5. Later, when online, an agent reviews the queue and downloads/enriches relevant local knowledge-base content.
+6. Future offline answers can cover the questions students actually needed help with.
 
 ## Repository
 https://github.com/cozyss/jetson-voice-ai-monitor
