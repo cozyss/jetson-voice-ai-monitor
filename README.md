@@ -151,3 +151,16 @@ See [`HACKATHON_SUBMISSION.md`](HACKATHON_SUBMISSION.md) for copy/paste submissi
 ## License
 
 MIT
+
+### Current demo behavior
+
+The packaged daemon now mirrors the live Jetson demo:
+
+- offline-first Qwen tutoring with local KB context injection;
+- saved Q&A review queue (`qa_review_queue.json`);
+- weak-answer/knowledge-gap queue (`weak_answers.json`);
+- local KB enrichment file (`knowledge_base/kb_items.json`);
+- dashboard view for saved Q&A, Internet God judgments, enriched KB items, and manual cleanup;
+- voice-output polishing so ordinary spoken answers stay short, while explicit detailed prompts can be longer.
+
+Runtime queues and KB files are not committed. Example JSON structures live in `examples/`.

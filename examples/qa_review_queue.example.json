@@ -1,0 +1,10 @@
+[
+  {
+    "id": "qa-example-001",
+    "ts": "2026-06-07T00:00:00+00:00",
+    "status": "pending",
+    "question": "Why do plants need sunlight?",
+    "answer": "Plants use sunlight to make their own food through photosynthesis.",
+    "source": "voice"
+  }
+]

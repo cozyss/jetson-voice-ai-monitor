@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, time, json, struct, select, subprocess, threading, signal, glob, urllib.request, urllib.error, queue, re, uuid
+import os, sys, time, json, struct, select, subprocess, threading, signal, glob, urllib.request, urllib.error, urllib.parse, queue, re, uuid
 from datetime import datetime, timezone
 import tempfile
 
@@ -68,7 +68,7 @@ SHELL_TOOL_TIMEOUT = int(os.environ.get('VOICE_SHELL_TOOL_TIMEOUT', '30'))
 SHELL_TOOL_MAX_CHARS = int(os.environ.get('VOICE_SHELL_TOOL_MAX_CHARS', '2000'))
 SHELL_TOOL_WORKDIR = os.environ.get('VOICE_SHELL_TOOL_WORKDIR', BASE)
 SELF_IMPROVE_ENABLED = os.environ.get('VOICE_SELF_IMPROVE_ENABLED', '1') != '0'
-SELF_IMPROVE_AGENT_ID = os.environ.get('VOICE_SELF_IMPROVE_AGENT_ID', 'ih7u2H')
+SELF_IMPROVE_AGENT_ID = os.environ.get('VOICE_SELF_IMPROVE_AGENT_ID', '')
 SELF_IMPROVE_API_KEY = os.environ.get('VOICE_SELF_IMPROVE_API_KEY', '')
 SELF_IMPROVE_API_URL = os.environ.get('VOICE_SELF_IMPROVE_API_URL', 'https://staging.sld.dev/api/functions/workspace.agent.notify')
 SELF_IMPROVE_MAX_CHARS = int(os.environ.get('VOICE_SELF_IMPROVE_MAX_CHARS', '2000'))
@@ -92,16 +92,24 @@ SYSTEM_JUDGE_NET_CACHE_SECONDS = float(os.environ.get('VOICE_SYSTEM_JUDGE_NET_CA
 SYSTEM_JUDGE_SELF_IMPROVE_MIN_CONFIDENCE = float(os.environ.get('VOICE_SYSTEM_JUDGE_SELF_IMPROVE_MIN_CONFIDENCE', '0.88'))
 _system_judge_net_cache = {'ts': 0.0, 'ok': False}
 
-# Offline education improvement loop: Qwen answers locally, then grades whether
-# the answer was actually useful. Weak answers are stored until internet is
-# available, then converted into one self-improvement request.
+# Offline education knowledge-base loop: Qwen answers locally, then grades whether
+# the answer was actually useful. Weak/missing-knowledge answers are stored until
+# internet is available, then used ONLY to enrich the local knowledge base.
 WEAK_ANSWERS = os.path.join(BASE, 'weak_answers.json')
+QA_REVIEW_LOG = os.path.join(BASE, 'qa_review_queue.json')
+QA_REVIEW_MAX_ITEMS = int(os.environ.get('VOICE_QA_REVIEW_MAX_ITEMS', '200'))
+KB_DIR = os.path.join(BASE, 'knowledge_base')
+KB_FILE = os.path.join(KB_DIR, 'kb_items.json')
+KB_ENABLED = os.environ.get('VOICE_KB_ENABLED', '1') != '0'
+KB_MAX_CONTEXT_CHARS = int(os.environ.get('VOICE_KB_MAX_CONTEXT_CHARS', '2400'))
+KB_FETCH_TIMEOUT = float(os.environ.get('VOICE_KB_FETCH_TIMEOUT', '12'))
 ANSWER_QUALITY_ENABLED = os.environ.get('VOICE_ANSWER_QUALITY_ENABLED', '1') != '0'
 ANSWER_QUALITY_THRESHOLD = float(os.environ.get('VOICE_ANSWER_QUALITY_THRESHOLD', '0.72'))
 WEAK_ANSWER_MAX_ITEMS = int(os.environ.get('VOICE_WEAK_ANSWER_MAX_ITEMS', '200'))
 CONNECTIVITY_MODE = os.environ.get('VOICE_CONNECTIVITY_MODE', 'connect_to_internet_demo')
 
 os.makedirs(AUDIO_DIR, exist_ok=True)
+os.makedirs(KB_DIR, exist_ok=True)
 lock = threading.RLock()
 record_proc = None
 record_path = None
@@ -123,8 +131,8 @@ state = {
     'audio_file': '',
     'tts_enabled': TTS_ENABLED,
         'tts_cmd': TTS_CMD,
-        'tts_voice': 'Qwen/local answer: male Piper en_US-ryan-high',
-        'tts_system_voice': 'System judge/tool status: nice female Piper en_US-lessac-high',
+        'tts_voice': 'Local Jetson Tutor: male Piper en_US-ryan-high',
+        'tts_system_voice': 'Internet God / tools: nice female Piper en_US-lessac-high',
     'live_transcribe_enabled': LIVE_TRANSCRIBE_ENABLED,
     'speaking': False,
     'speaking_text': '',
@@ -136,12 +144,17 @@ state = {
     'system_judge_require_internet': SYSTEM_JUDGE_REQUIRE_INTERNET,
     'weather_enabled': True,
     'last_system_judge': {},
-    'answer_quality_enabled': ANSWER_QUALITY_ENABLED,
-    'last_answer_quality': {},
+    'answer_quality_enabled': False,
+    'last_answer_quality': {'enabled': False, 'source': 'internet_god_deferred', 'reason': 'Local tutor does not judge its own answers; Internet God reviews saved Q&A on connect.'},
+    'qa_review_count': 0,
+    'qa_review_list': [],
     'weak_answer_count': 0,
     'weak_answer_list': [],
     'connectivity_mode': CONNECTIVITY_MODE,
     'last_internet_review': {},
+    'kb_enabled': KB_ENABLED,
+    'kb_item_count': 0,
+    'kb_last_enrichment': {},
     'self_improve_enabled': SELF_IMPROVE_ENABLED,
     'conversation_memory_enabled': HISTORY_ENABLED,
     'history_turns': HISTORY_TURNS,
@@ -363,7 +376,7 @@ def tts_say(text, voice='assistant'):
         fd, wav = tempfile.mkstemp(prefix=f'voice-{voice}-', suffix='.wav', dir='/tmp')
         os.close(fd)
         if voice == 'system':
-            # System judge/tool-status voice: nice female Piper, distinct from the male Qwen/local answer voice.
+            # Internet God/tool-status voice: nice female Piper, distinct from the male Local Jetson Tutor answer voice.
             try:
                 piper = PIPER_BIN if os.path.exists(PIPER_BIN) else '/workspace/piper/piper'
                 subprocess.run([
@@ -379,7 +392,7 @@ def tts_say(text, voice='assistant'):
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20, check=True)
             subprocess.run(['aplay', '-D', TTS_AUDIO_DEVICE, wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False)
         else:
-            # Qwen/local assistant voice: male Piper en_US-ryan-high.
+            # Local Jetson Tutor assistant voice: male Piper en_US-ryan-high.
             piper = PIPER_BIN if os.path.exists(PIPER_BIN) else '/workspace/piper/piper'
             subprocess.run([
                 piper,
@@ -553,16 +566,26 @@ def active_tool_specs():
             tools.append(SELF_IMPROVE_TOOL_SPEC)
     return tools
 
-VOICE_SYSTEM_PROMPT = """You are a concise local voice assistant running on a Jetson.
-Answer naturally and briefly unless asked for detail.
+VOICE_SYSTEM_PROMPT = """You are the Local Jetson Tutor running on a Jetson.
+Default internet is OFF. First decide internally whether you can give a good concise local answer. If you can, answer accurately and briefly. If you cannot, be honest and give the best short local answer you can; the daemon will save the question for later Internet God review and KB enrichment.
+
+Spoken-answer style is important because your response will be read aloud:
+- Default to 1 or 2 short sentences, about 10 to 30 spoken words total.
+- Use plain, conversational language, like a patient tutor speaking to one student.
+- Start with the direct answer; avoid preambles like "Sure", "Certainly", or "Here is".
+- Avoid markdown, headings, bullet lists, citations, parentheses, and long clauses unless the user explicitly asks for detail.
+- If the user asks for a longer explanation, still speak in short chunks and keep it easy to say aloud.
+- For children or offline education questions, be warm and clear, but do not over-explain.
+
 You are given a short rolling conversation history before the latest user message; use it for context and continuity.
 You have a tool named run_python_code for calculations and small Python tasks.
 You have a tool named run_shell_command for local Jetson commands such as ping, network checks, disk/memory status, process checks, and other command-line tasks.
 You have a tool named get_current_weather for current weather by city/place. Use it proactively for weather questions.
-You have a tool named self_improve for requests to add features, improve the device, fix bugs, or change this assistant's code. Use self_improve whenever the user asks for a device/code/behavior improvement. Never claim a self-improvement request was sent unless the self_improve tool was actually called and returned ok.
+You may have a self_improve tool for device/code bugs, but offline education learning gaps are NOT code self-improvements: weak school answers are saved to a knowledge-base enrichment queue and refreshed when internet is available.
 Use tools proactively. Do not say you lack the ability to ping, inspect the system, run Python, check weather, or run local commands; call run_shell_command, run_python_code, or get_current_weather instead. Do not ask for confirmation before ordinary local read-only/status commands.
 If a tool is useful, call it silently; do not narrate tool calls or mention internal tool syntax.
-After tool results are returned, give only the final user-facing answer."""
+When relevant local knowledge-base notes are provided, use them as supporting offline educational context.
+After tool results are returned, give only the final user-facing spoken answer."""
 
 def run_note_tool_use(arguments):
     try:
@@ -729,15 +752,11 @@ def run_self_improve_tool(arguments):
 
 def speak_final_response(response):
     response = (response or '').strip()
-    speech_buf = response
-    while True:
-        chunk, speech_buf = split_speech_ready(speech_buf, force=False)
-        if not chunk:
-            break
-        queue_speech(chunk)
-    chunk, speech_buf = split_speech_ready(speech_buf, force=True)
-    if chunk:
-        queue_speech(chunk)
+    # Audio policy: wait until Local Jetson Tutor has produced the complete
+    # final text answer, then synthesize/play that complete answer. Do not
+    # speak partial answer chunks while the model is generating.
+    if response:
+        queue_speech(response)
 
 def looks_like_self_improve_request(text):
     t = (text or '').lower()
@@ -931,6 +950,7 @@ def handle_weather_direct(text):
         save_state()
     speak_final_response(response)
     append_history_turn(text, response)
+    record_qa_for_internet_review(text, response, {'direct_weather': True, 'location': loc})
     return response, {'tool_calling': TOOL_CALLING_ENABLED, 'direct_weather': True, 'location': loc}
 
 def handle_ping_direct(text):
@@ -958,6 +978,7 @@ def handle_ping_direct(text):
         save_state()
     speak_final_response(response)
     append_history_turn(text, response)
+    record_qa_for_internet_review(text, response, {'direct_ping': True, 'target': target})
     return response, {'tool_calling': TOOL_CALLING_ENABLED, 'direct_ping': True, 'target': target}
 
 SYSTEM_JUDGE_PROMPT = """You are the fast system judge in front of a Jetson voice assistant.
@@ -1065,6 +1086,245 @@ def update_weak_answer_state(items=None):
     except Exception as e:
         log_event('weak_answer_error', 'Could not update weak-answer state: ' + str(e))
 
+
+
+def load_qa_review_items():
+    try:
+        with open(QA_REVIEW_LOG) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log_event('qa_review_error', 'Could not load Q&A review queue: ' + str(e))
+        return []
+
+def save_qa_review_items(items):
+    items = list(items or [])[-QA_REVIEW_MAX_ITEMS:]
+    tmp = f"{QA_REVIEW_LOG}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, 'w') as f:
+        json.dump(items, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, QA_REVIEW_LOG)
+    update_qa_review_state(items)
+
+def pending_qa_review_items(items=None):
+    items = load_qa_review_items() if items is None else list(items or [])
+    return [x for x in items if x.get('status', 'pending') == 'pending']
+
+def update_qa_review_state(items=None):
+    try:
+        items = load_qa_review_items() if items is None else list(items or [])
+        pending = pending_qa_review_items(items)
+        preview = []
+        for x in pending[-10:]:
+            preview.append({
+                'id': x.get('id',''), 'ts': x.get('ts',''),
+                'question': (x.get('question') or '')[:500],
+                'answer': (x.get('answer') or '')[:500],
+                'status': x.get('status','pending')
+            })
+        with lock:
+            state['answer_quality_enabled'] = False
+            state['qa_review_count'] = len(pending)
+            state['qa_review_list'] = preview
+            state['last_answer_quality'] = state.get('last_answer_quality') or {'enabled': False, 'source': 'internet_god_deferred'}
+            save_state()
+    except Exception as e:
+        log_event('qa_review_error', 'Could not update Q&A review state: ' + str(e))
+
+def record_qa_for_internet_review(question, answer, route_meta=None):
+    qtext = (question or '').strip()
+    atext = (answer or '').strip()
+    if not qtext and not atext:
+        return {'enabled': False, 'queued_for_internet_god': False, 'reason': 'empty turn'}
+    items = load_qa_review_items()
+    # Coalesce immediate duplicate pending questions so repeated retries do not spam the review queue.
+    for x in reversed(items[-20:]):
+        if x.get('status','pending') == 'pending' and (x.get('question') or '').strip().lower() == qtext.lower():
+            x['last_seen'] = now()
+            x['answer'] = atext
+            x['route_meta'] = route_meta or {}
+            save_qa_review_items(items)
+            result = {'enabled': False, 'queued_for_internet_god': True, 'source': 'internet_god_deferred', 'reason': 'Updated existing pending Q&A; Internet God will judge on connect.'}
+            with lock:
+                state['last_answer_quality'] = result
+                save_state()
+            log_event('qa_review_queued', qtext[:500], id=x.get('id'), updated=True)
+            return result
+    rec = {
+        'id': 'qa-' + str(uuid.uuid4())[:8],
+        'ts': now(),
+        'status': 'pending',
+        'question': qtext,
+        'answer': atext,
+        'route_meta': route_meta or {}
+    }
+    items.append(rec)
+    save_qa_review_items(items)
+    result = {'enabled': False, 'queued_for_internet_god': True, 'source': 'internet_god_deferred', 'reason': 'Saved Q&A for Internet God review on next connect.', 'qa_id': rec['id']}
+    with lock:
+        state['last_answer_quality'] = result
+        save_state()
+    log_event('qa_review_queued', qtext[:500], id=rec['id'])
+    return result
+
+def internet_god_review_qa(item):
+    if not (SYSTEM_JUDGE_ENABLED and SYSTEM_JUDGE_API_KEY):
+        raise RuntimeError('Internet God/OpenRouter key is not available')
+    if not system_judge_internet_available():
+        raise RuntimeError('Internet is not available for Internet God review')
+    prompt = (
+        "You are Internet God reviewing an offline Local Jetson Tutor answer for Afghan girls' education. "
+        "Judge whether the answer is good enough for a student using an offline learning device. "
+        "If the answer is inaccurate, vague, too incomplete, evasive, or missing important educational facts, set needs_enrichment=true and specify exactly what local knowledge-base content should be downloaded. "
+        "If the answer is adequate, set needs_enrichment=false. Scope is ONLY knowledge-base enrichment; do not request code, tools, device features, or behavior changes. "
+        "Return ONLY compact JSON with keys: needs_enrichment boolean, score number 0..1, reason string, missing_knowledge string, suggested_improvement string, search_query string.\n\n"
+        f"Question:\n{(item.get('question') or '')[:2200]}\n\nLocal Jetson Tutor answer:\n{(item.get('answer') or '')[:2600]}"
+    )
+    payload = {
+        'model': SYSTEM_JUDGE_MODEL,
+        'messages': [
+            {'role':'system','content':'Return compact JSON only. No markdown.'},
+            {'role':'user','content': prompt}
+        ],
+        'max_tokens': 320,
+        'temperature': 0
+    }
+    obj = openrouter_post(payload, timeout=max(SYSTEM_JUDGE_TIMEOUT, 20))
+    msg = (((obj.get('choices') or [{}])[0]).get('message') or {}).get('content') or ''
+    verdict = extract_json_object(msg)
+    if not verdict:
+        raise RuntimeError('Internet God returned unparsable review: ' + msg[:200])
+    try:
+        score = float(verdict.get('score', 0.0) or 0.0)
+    except Exception:
+        score = 0.0
+    needs = bool(verdict.get('needs_enrichment')) or score < ANSWER_QUALITY_THRESHOLD
+    return {
+        'needs_enrichment': needs,
+        'score': score,
+        'reason': str(verdict.get('reason') or '')[:600],
+        'missing_knowledge': str(verdict.get('missing_knowledge') or '')[:800],
+        'suggested_improvement': str(verdict.get('suggested_improvement') or '')[:900],
+        'search_query': str(verdict.get('search_query') or '')[:240],
+        'source': 'internet_god',
+        'model': SYSTEM_JUDGE_MODEL,
+        'raw': msg[:600]
+    }
+
+def load_kb_items():
+    if not KB_ENABLED:
+        return []
+    try:
+        with open(KB_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log_event('kb_error', 'Could not load knowledge base: ' + str(e))
+        return []
+
+def save_kb_items(items):
+    os.makedirs(KB_DIR, exist_ok=True)
+    out=[]; seen=set()
+    for x in items or []:
+        key=((x.get('source_url') or '')[:300], (x.get('title') or '')[:200], (x.get('question') or '')[:300], (x.get('query') or '')[:200])
+        if key in seen: continue
+        seen.add(key); out.append(x)
+    tmp=f"{KB_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp,'w') as f: json.dump(out[-500:], f, ensure_ascii=False, indent=2)
+    os.replace(tmp, KB_FILE)
+    with lock:
+        state['kb_item_count'] = len(out[-500:])
+        save_state()
+
+def simple_terms(text):
+    stop=set('the a an and or but is are was were be been being to of in on for from with by about what why how when where who whom which explain tell me please girl girls student students'.split())
+    words=re.findall(r"[a-zA-Z][a-zA-Z0-9'-]{2,}", (text or '').lower())
+    return [w for w in words if w not in stop][:40]
+
+def derive_kb_query(item):
+    base = (item.get('search_query') or item.get('missing_knowledge') or item.get('suggested_improvement') or item.get('question') or '').strip()
+    base = re.sub(r'(?i)^(download|add|include|learn about|content about)\s+', '', base)
+    return ' '.join(simple_terms(base))[:180] or (item.get('question') or '')[:180]
+
+def http_json(url, timeout=None):
+    req=urllib.request.Request(url, headers={'User-Agent':'JetsonVoiceAI-KB-Enricher/1.0'})
+    with urllib.request.urlopen(req, timeout=timeout or KB_FETCH_TIMEOUT) as resp:
+        return json.loads(resp.read().decode('utf-8','replace'))
+
+def fetch_kb_for_weak_answer(item):
+    query = derive_kb_query(item)
+    snippets=[]
+    try:
+        url='https://api.duckduckgo.com/?' + urllib.parse.urlencode({'q':query,'format':'json','no_redirect':'1','no_html':'1','skip_disambig':'1'})
+        data=http_json(url)
+        if data.get('AbstractText'):
+            snippets.append({'source':'duckduckgo','title':data.get('Heading') or query,'source_url':data.get('AbstractURL') or '', 'text':data.get('AbstractText') or ''})
+        for rt in (data.get('RelatedTopics') or [])[:5]:
+            if isinstance(rt, dict) and rt.get('Text'):
+                snippets.append({'source':'duckduckgo_related','title':rt.get('FirstURL','').rsplit('/',1)[-1].replace('_',' ') or query,'source_url':rt.get('FirstURL') or '', 'text':rt.get('Text') or ''})
+    except Exception as e:
+        snippets.append({'source':'fetch_error','title':'DuckDuckGo fetch failed','source_url':'','text':str(e)[:300]})
+    if not any(x.get('text') and x.get('source') != 'fetch_error' for x in snippets):
+        try:
+            url='https://en.wikipedia.org/w/api.php?' + urllib.parse.urlencode({'action':'query','list':'search','srsearch':query,'format':'json','srlimit':'3'})
+            data=http_json(url)
+            for row in ((data.get('query') or {}).get('search') or []):
+                title=row.get('title') or query
+                try:
+                    su='https://en.wikipedia.org/api/rest_v1/page/summary/' + urllib.parse.quote(title.replace(' ','_'))
+                    sd=http_json(su)
+                    summary=sd.get('extract') or re.sub('<[^<]+?>','',row.get('snippet',''))
+                    page_url=((sd.get('content_urls') or {}).get('desktop') or {}).get('page') or ('https://en.wikipedia.org/wiki/'+urllib.parse.quote(title.replace(' ','_')))
+                except Exception:
+                    summary=re.sub('<[^<]+?>','',row.get('snippet',''))
+                    page_url='https://en.wikipedia.org/wiki/'+urllib.parse.quote(title.replace(' ','_'))
+                if summary:
+                    snippets.append({'source':'wikipedia','title':title,'source_url':page_url,'text':summary})
+        except Exception as e:
+            snippets.append({'source':'fetch_error','title':'Wikipedia fetch failed','source_url':'','text':str(e)[:300]})
+    good=[x for x in snippets if x.get('text') and x.get('source') != 'fetch_error']
+    return {'id':'kb-'+str(uuid.uuid4())[:8], 'ts':now(), 'status':'active', 'query':query, 'question':item.get('question',''), 'weak_answer_id':item.get('id',''), 'missing_knowledge':item.get('missing_knowledge',''), 'suggested_improvement':item.get('suggested_improvement',''), 'snippets':good[:8], 'errors':[x for x in snippets if x.get('source')=='fetch_error'][:3]}
+
+def load_kb_context(question):
+    if not KB_ENABLED:
+        return ''
+    items=load_kb_items()
+    with lock:
+        state['kb_item_count'] = len(items)
+        save_state()
+    if not items:
+        return ''
+    qterms=set(simple_terms(question))
+    scored=[]
+    for it in items:
+        hay=' '.join([it.get('query',''), it.get('question',''), it.get('missing_knowledge',''), ' '.join((sn.get('title','')+' '+sn.get('text','')) for sn in it.get('snippets',[])[:3])]).lower()
+        score=sum(1 for t in qterms if t in hay)
+        if score>0: scored.append((score,it))
+    scored.sort(key=lambda x:x[0], reverse=True)
+    chunks=[]
+    for _,it in scored[:4]:
+        for sn in (it.get('snippets') or [])[:3]:
+            txt=(sn.get('text') or '').strip()
+            if txt: chunks.append(f"Title: {sn.get('title','')}; Source: {sn.get('source','')}; Notes: {txt[:700]}")
+    return '\n'.join(chunks)[:KB_MAX_CONTEXT_CHARS]
+
+
+def is_exact_reply_request(question, answer):
+    q = (question or '').strip()
+    a = (answer or '').strip()
+    m = re.search(r'reply\s+with\s+exactly\s*:\s*(.+)$', q, re.I|re.S)
+    if not m:
+        m = re.search(r'say\s+exactly\s*:\s*(.+)$', q, re.I|re.S)
+    if not m:
+        return False
+    expected = m.group(1).strip().strip('"\'“”‘’')
+    # If a test marker precedes the instruction, only compare the requested literal phrase.
+    expected = expected.split('\n', 1)[0].strip()
+    return a.lower().strip(' .!') == expected.lower().strip(' .!')
+
 def answer_quality_heuristic(question, answer):
     a = (answer or '').strip().lower()
     weak_phrases = [
@@ -1089,9 +1349,10 @@ def evaluate_answer_quality(question, answer):
         heuristic['source'] = 'heuristic'
         return heuristic
     prompt = (
-        "You are an offline education quality checker for Afghan girls using a no-internet learning device. "
-        "Grade whether the assistant's answer actually answered the student's question well enough to be useful offline. "
-        "Be strict about refusals, missing knowledge, hallucination, or vague answers. "
+        "You are an offline education knowledge-base quality checker for Afghan girls using a no-internet learning device. "
+        "Grade whether the local assistant answered the student's question well enough from the current offline knowledge base. "
+        "If the answer is vague, refuses, hallucinates, or lacks the facts needed for a useful lesson, mark answered_well=false and describe exactly what knowledge-base content should be downloaded later. "
+        "Do not request code/features/tools; the improvement scope is ONLY enriching the local knowledge base. "
         "Return ONLY JSON with keys: answered_well boolean, score number 0..1, reason string, missing_knowledge string, suggested_improvement string.\n\n"
         f"Student question:\n{(question or '')[:1800]}\n\nAssistant answer:\n{(answer or '')[:2400]}"
     )
@@ -1131,6 +1392,14 @@ def evaluate_answer_quality(question, answer):
         return {'enabled': True, 'answered_well': True, 'score': 0.74, 'reason': 'quality judging failed; not queueing to avoid false positives: ' + str(e)[:240], 'source': 'error'}
 
 def maybe_record_weak_answer(question, answer, route_meta=None):
+    if is_exact_reply_request(question, answer):
+        quality = {'enabled': True, 'answered_well': True, 'score': 1.0, 'reason': 'exact-reply request satisfied; not an education knowledge gap', 'source': 'exact_reply_guard'}
+        with lock:
+            state['last_answer_quality'] = quality
+            save_state()
+        log_event('answer_quality', quality.get('reason',''), score=quality.get('score'), answered_well=True, source=quality.get('source',''))
+        update_weak_answer_state()
+        return quality
     quality = evaluate_answer_quality(question, answer)
     with lock:
         state['last_answer_quality'] = quality
@@ -1170,6 +1439,7 @@ def maybe_record_weak_answer(question, answer, route_meta=None):
     return quality
 
 def build_weak_answer_improvement_request(pending):
+    # Backward-compatible name, but the scope is intentionally KB-only now.
     lines = []
     for i, x in enumerate(pending[:25], 1):
         lines.append(
@@ -1177,59 +1447,105 @@ def build_weak_answer_improvement_request(pending):
             f"   Local answer: {x.get('answer','')[:700]}\n"
             f"   Score: {x.get('score')} Reason: {x.get('reason','')}\n"
             f"   Missing knowledge: {x.get('missing_knowledge','')}\n"
-            f"   Suggested improvement: {x.get('suggested_improvement','')}"
+            f"   Suggested KB enrichment: {x.get('suggested_improvement','')}"
         )
     return (
-        "OFFLINE EDUCATION SELF-IMPROVEMENT REQUEST\n\n"
-        "Context: This Jetson/Qwen device is intended to help Afghan girls learn when they have the device but no internet. "
-        "The local Qwen assistant answered the following student questions poorly, according to its offline self-grade. "
-        "Please improve prompts, tools, local content, retrieval, or workflows so future offline answers are more useful without relying on internet.\n\n"
-        "Questions needing improvement:\n" + "\n\n".join(lines) + "\n\n"
-        "Acceptance test: after the update, ask representative saved questions again while offline; the dashboard should show higher answer-quality scores and no generic refusal if local educational help is possible."
+        "OFFLINE EDUCATION KNOWLEDGE-BASE ENRICHMENT REQUEST\n\n"
+        "Scope: knowledge base only. Do not change device features or agent behavior. "
+        "The local Qwen assistant answered these student questions poorly; enrich local offline educational content so future answers improve.\n\n"
+        "Questions needing KB coverage:\n" + "\n\n".join(lines)
     )
 
 def process_weak_answer_backlog(source='internet_demo'):
     try:
-        items = load_weak_answers()
-        pending = pending_weak_answers(items)
-        if not pending:
-            review = {'ok': True, 'source': source, 'pending': 0, 'message': 'No weak answers to review.'}
+        qa_items = load_qa_review_items(); pending_qa = pending_qa_review_items(qa_items)
+        legacy_items = load_weak_answers(); legacy_pending = pending_weak_answers(legacy_items)
+        queue_system_speech('Now you are connecting to the Internet, and Internet God is reviewing the saved questions and answers to update the knowledge base.')
+        if not pending_qa and not legacy_pending:
+            review = {'ok': True, 'source': source, 'qa_reviewed': 0, 'kb_items_added': 0, 'message': 'No saved Q&A turns need Internet God review.', 'scope': 'knowledge_base_only'}
             with lock:
-                state['last_internet_review'] = review
-                state['connectivity_mode'] = CONNECTIVITY_MODE
-                save_state()
+                state['last_internet_review'] = review; state['connectivity_mode'] = CONNECTIVITY_MODE; state['kb_item_count'] = len(load_kb_items()); save_state()
+            update_qa_review_state(qa_items); update_weak_answer_state(legacy_items)
             log_event('internet_review', review['message'], pending=0, source=source)
-            queue_system_speech('Internet connected. No saved weak answers to review.')
+            queue_system_speech('No saved questions and answers need review right now.')
             return review
-        req = build_weak_answer_improvement_request(pending)
-        queue_system_speech(f'Internet connected. Reviewing {len(pending)} saved weak answers for self improvement.')
-        result_text = run_self_improve_tool({'request': req})
-        try:
-            result = json.loads(result_text)
-        except Exception:
-            result = {'ok': False, 'raw': result_text[:1000]}
-        submitted = 0
-        if result.get('ok'):
-            ids = {x.get('id') for x in pending}
-            for x in items:
-                if x.get('id') in ids and x.get('status','pending') == 'pending':
-                    x['status'] = 'submitted'
-                    x['submitted_at'] = now()
-                    submitted += 1
-            save_weak_answers(items)
-        review = {'ok': bool(result.get('ok')), 'source': source, 'pending_reviewed': len(pending), 'submitted': submitted, 'result': result}
+        if pending_qa:
+            queue_system_speech(f'Internet God is reviewing {len(pending_qa)} saved questions and answers.')
+        kb_items = load_kb_items(); enriched = 0; failed = 0; reviewed = 0; cleared_qa=set(); cleared_legacy=set(); details=[]; new_unresolved=[]
+        # First, Internet God reviews the raw Q&A turns since the last update.
+        for x in pending_qa[:30]:
+            try:
+                verdict = internet_god_review_qa(x)
+                reviewed += 1
+                x['internet_god_judgment'] = verdict
+                x['reviewed_at'] = now()
+                detail = {'qa_id': x.get('id'), 'question': (x.get('question') or '')[:220], 'score': verdict.get('score'), 'needs_enrichment': verdict.get('needs_enrichment'), 'reason': verdict.get('reason','')[:300]}
+                if verdict.get('needs_enrichment'):
+                    weak = {
+                        'id': 'weak-' + str(uuid.uuid4())[:8],
+                        'ts': now(), 'status': 'pending',
+                        'question': x.get('question',''), 'answer': x.get('answer',''),
+                        'score': verdict.get('score'), 'reason': verdict.get('reason',''),
+                        'missing_knowledge': verdict.get('missing_knowledge',''),
+                        'suggested_improvement': verdict.get('suggested_improvement',''),
+                        'search_query': verdict.get('search_query',''),
+                        'quality': verdict, 'qa_review_id': x.get('id')
+                    }
+                    kb = fetch_kb_for_weak_answer(weak); kb_items.append(kb)
+                    detail.update({'weak_answer_id': weak['id'], 'query': kb.get('query'), 'snippets': len(kb.get('snippets') or []), 'errors': kb.get('errors', [])[:1]})
+                    if kb.get('snippets'):
+                        enriched += 1; cleared_qa.add(x.get('id')); x['status'] = 'reviewed'
+                    else:
+                        failed += 1; new_unresolved.append(weak); x['status'] = 'reviewed_unresolved'
+                else:
+                    cleared_qa.add(x.get('id')); x['status'] = 'reviewed'
+                details.append(detail)
+            except Exception as e:
+                failed += 1
+                details.append({'qa_id': x.get('id'), 'error': str(e)[:300], 'kept_pending': True})
+        # Backward compatibility: still enrich any old unresolved weak-answer records left from earlier versions.
+        for x in legacy_pending[:25]:
+            try:
+                kb = fetch_kb_for_weak_answer(x); kb_items.append(kb)
+                detail = {'weak_answer_id': x.get('id'), 'query': kb.get('query'), 'snippets': len(kb.get('snippets') or []), 'errors': kb.get('errors', [])[:1], 'legacy': True}
+                if kb.get('snippets'):
+                    enriched += 1; cleared_legacy.add(x.get('id'))
+                else:
+                    failed += 1
+                details.append(detail)
+            except Exception as e:
+                failed += 1; details.append({'weak_answer_id': x.get('id'), 'error': str(e)[:300], 'legacy': True})
+        save_kb_items(kb_items)
+        # Remove reviewed/good/enriched Q&A from the between-updates queue; keep failed review attempts pending.
+        # Keep reviewed Q&A turns as an audit/history log, including Internet God's judgment.
+        # Only failed/unreviewed items remain pending and count as awaiting review.
+        save_qa_review_items(qa_items)
+        # Remove enriched legacy weak gaps; keep unresolved failed gaps, plus any new unresolved gaps from Q&A review.
+        remaining_weak = [x for x in legacy_items if not (x.get('id') in cleared_legacy and x.get('status','pending') == 'pending')]
+        remaining_weak.extend(new_unresolved)
+        save_weak_answers(remaining_weak)
+        review = {
+            'ok': reviewed > 0 or enriched > 0,
+            'source': source,
+            'qa_reviewed': reviewed,
+            'qa_items_reviewed_and_saved': len(cleared_qa),
+            'legacy_gaps_reviewed': len(legacy_pending[:25]),
+            'kb_items_added': enriched,
+            'unresolved_gaps': len(new_unresolved),
+            'failed': failed,
+            'details': details[:40],
+            'scope': 'knowledge_base_only',
+            'message': f'Internet God reviewed {reviewed} Q&A turns and added {enriched} KB items.'
+        }
         with lock:
-            state['last_internet_review'] = review
-            state['connectivity_mode'] = CONNECTIVITY_MODE
-            save_state()
-        log_event('internet_review', 'Reviewed weak-answer backlog', pending=len(pending), submitted=submitted, ok=review['ok'])
+            state['last_internet_review'] = review; state['kb_last_enrichment'] = review; state['kb_item_count'] = len(load_kb_items()); state['connectivity_mode'] = CONNECTIVITY_MODE; save_state()
+        log_event('internet_god_qa_review', review['message'], qa_reviewed=reviewed, enriched=enriched, failed=failed, source=source)
+        queue_system_speech(f'Internet God reviewed {reviewed} saved answers and added {enriched} knowledge base updates.')
         return review
     except Exception as e:
-        review = {'ok': False, 'source': source, 'error': str(e)}
+        review = {'ok': False, 'source': source, 'error': str(e), 'scope': 'knowledge_base_only'}
         with lock:
-            state['last_internet_review'] = review
-            state['last_error'] = str(e)
-            save_state()
+            state['last_internet_review'] = review; state['last_error'] = str(e); save_state()
         log_event('internet_review_error', str(e), source=source)
         return review
 
@@ -1342,6 +1658,55 @@ def apply_system_judge(text):
         save_state()
     return verdict
 
+
+
+def looks_like_exact_response_request(text):
+    t = (text or '').lower()
+    return any(m in t for m in ['reply with exactly', 'answer exactly', 'say exactly', 'respond with exactly', 'repeat exactly'])
+
+def spoken_max_tokens_for(text):
+    t = (text or '').lower()
+    detailed_markers = [
+        'explain in detail', 'detailed', 'step by step', 'step-by-step',
+        'long answer', 'full explanation', 'tell me everything', 'essay',
+        'list all', 'compare and contrast', 'why exactly'
+    ]
+    if any(m in t for m in detailed_markers):
+        return min(QWEN_MAX_TOKENS, 700)
+    return min(QWEN_MAX_TOKENS, int(os.environ.get('VOICE_QWEN_SPOKEN_DEFAULT_MAX_TOKENS', '160')))
+
+
+def polish_spoken_response(user_text, response):
+    response = (response or '').strip()
+    if not response or looks_like_exact_response_request(user_text):
+        return response
+    words = response.split()
+    sentence_count = sum(response.count(x) for x in '.!?')
+    wants_detail = spoken_max_tokens_for(user_text) > 200
+    if wants_detail or (len(words) <= 35 and sentence_count <= 3 and '\n' not in response and '-' not in response[:20]):
+        return response
+    try:
+        payload = {
+            'model': 'qwen-voice-local',
+            'messages': [
+                {'role': 'system', 'content': 'Rewrite the answer for text-to-speech. Keep the same meaning, but make it natural spoken English. Maximum 30 words. One or two short sentences. No markdown. No preamble.'},
+                {'role': 'user', 'content': 'Question: ' + (user_text or '') + '\n\nAnswer to rewrite: ' + response}
+            ],
+            'max_tokens': 80,
+            'temperature': 0.1,
+            'stream': False,
+            'chat_template_kwargs': {'enable_thinking': False}
+        }
+        obj = qwen_post(payload, timeout=120)
+        msg = ((obj.get('choices') or [{}])[0].get('message') or {}).get('content') or ''
+        polished = msg.strip().strip('"')
+        if polished and len(polished.split()) <= max(45, len(words)):
+            log_event('spoken_polish', 'shortened response for speech', before_words=len(words), after_words=len(polished.split()))
+            return polished
+    except Exception as e:
+        log_event('spoken_polish_error', str(e)[:500])
+    return response
+
 def ask_qwen(text):
     # Deterministic local routes run before the external judge so obvious built-in
     # capabilities don't get misrouted or delayed by internet/model judgment.
@@ -1351,12 +1716,31 @@ def ask_qwen(text):
         return handle_ping_direct(text)
     if TOOL_CALLING_ENABLED and looks_like_weather_request(text):
         return handle_weather_direct(text)
-    judge = apply_system_judge(text) if SYSTEM_JUDGE_ENABLED else {'route': 'qwen'}
-    if judge.get('route') == 'self_improve':
-        req = (judge.get('improvement_request') or text or '').strip()
-        return handle_self_improve_direct(req)
+    # New offline-first education flow: ordinary questions do NOT go to the
+    # external Internet God/system judge. The Local Jetson Tutor answers first
+    # with local model/tools/KB; answer-quality grading later saves weak answers
+    # to the KB queue. Internet God only speaks/runs when the user presses
+    # Connect to Internet / Enrich KB, or for explicit non-education self-improve.
+    judge = {
+        'route': 'qwen',
+        'enabled': False,
+        'skipped': True,
+        'agent': 'Local Jetson Tutor',
+        'reason': 'Internet is off by default; Local Jetson Tutor answers first.',
+        'local_plan': 'Use the local Jetson model, local tools, and local KB. If the answer is weak, save the question to the KB enrichment queue.',
+        'spoken_status': '',
+        'judge_audio_spoken': False,
+        'audio_policy': 'Internet God is silent until Connect to Internet + Enrich KB.'
+    }
+    with lock:
+        state['last_system_judge'] = judge
+        save_state()
     history_messages = trim_history(load_history())
-    messages = [{'role':'system','content': VOICE_SYSTEM_PROMPT}] + history_messages + [
+    kb_context = load_kb_context(text)
+    system_prompt = VOICE_SYSTEM_PROMPT
+    if kb_context:
+        system_prompt += '\n\nRelevant local offline knowledge-base notes (use these to answer student questions; cite plainly if helpful):\n' + kb_context
+    messages = [{'role':'system','content': system_prompt}] + history_messages + [
         {'role':'user','content': text}
     ]
     forced_tool_used = append_forced_tool_use(messages, text)
@@ -1367,8 +1751,8 @@ def ask_qwen(text):
         payload = {
             'model': 'qwen-voice-local',
             'messages': messages,
-            'max_tokens': QWEN_MAX_TOKENS,
-            'temperature': 0.2 if TOOL_CALLING_ENABLED else 0.6,
+            'max_tokens': spoken_max_tokens_for(text),
+            'temperature': 0.15 if TOOL_CALLING_ENABLED else 0.45,
             'stream': False,
             'chat_template_kwargs': {'enable_thinking': False}
         }
@@ -1403,14 +1787,15 @@ def ask_qwen(text):
         break
     if not response:
         response = 'I ran the tool, but I could not produce a final answer.'
+    response = polish_spoken_response(text, response)
     with lock:
         state['partial_response'] = response
         state['last_response'] = response
         save_state()
     speak_final_response(response)
     append_history_turn(text, response)
-    quality = maybe_record_weak_answer(text, response, {'system_judge': judge, 'rounds': len(raw_rounds)})
-    return response, {'tool_calling': TOOL_CALLING_ENABLED, 'system_judge': judge, 'answer_quality': quality, 'force_tool_each_turn': FORCE_TOOL_EACH_TURN, 'forced_tool_used': forced_tool_used, 'rounds': len(raw_rounds), 'history_messages': len(history_messages)}
+    quality = record_qa_for_internet_review(text, response, {'system_judge': judge, 'rounds': len(raw_rounds)})
+    return response, {'tool_calling': TOOL_CALLING_ENABLED, 'system_judge': judge, 'answer_quality': quality, 'force_tool_each_turn': FORCE_TOOL_EACH_TURN, 'forced_tool_used': forced_tool_used, 'rounds': len(raw_rounds), 'history_messages': len(history_messages), 'kb_context_used': bool(kb_context)}
 
 def live_transcribe_loop(session_id, path):
     # Periodically transcribe a snapshot of the growing WAV while the button is still held/recording.
@@ -1455,7 +1840,7 @@ def process_text(transcript, source='text'):
         if not transcript:
             set_status('idle', last_error='Blank text command')
             return
-        set_status('thinking', last_transcript=transcript, last_response='', partial_response='', max_output_tokens=QWEN_MAX_TOKENS)
+        set_status('thinking', last_transcript=transcript, last_response='', partial_response='', speaking_text='', last_tool_name='', last_tool_result='', last_answer_quality={'enabled': False, 'source': 'internet_god_deferred', 'reason': 'Waiting for Local Jetson Tutor answer; Internet God reviews later.'}, last_system_judge={}, max_output_tokens=QWEN_MAX_TOKENS)
         log_event('thinking', 'Sending text to Qwen', source=source, text=transcript[:300])
         response, raw = ask_qwen(transcript)
         set_status('idle', last_response=response, partial_response=response, max_output_tokens=QWEN_MAX_TOKENS)
@@ -1473,13 +1858,13 @@ def process_audio(path):
         live_partial = (state.get('partial_transcript') or '').strip()
         if live_partial and USE_PARTIAL_ON_STOP:
             transcript = live_partial
-            set_status('thinking', last_transcript=transcript, partial_transcript=transcript, last_response='', partial_response='', max_output_tokens=QWEN_MAX_TOKENS)
+            set_status('thinking', last_transcript=transcript, partial_transcript=transcript, last_response='', partial_response='', speaking_text='', last_tool_name='', last_tool_result='', last_answer_quality={'enabled': False, 'source': 'internet_god_deferred', 'reason': 'Waiting for Local Jetson Tutor answer; Internet God reviews later.'}, last_system_judge={}, max_output_tokens=QWEN_MAX_TOKENS)
             log_event('transcript', transcript, audio_file=path, source='live_partial_used')
         else:
             set_status('transcribing')
             log_event('transcribing', 'Transcribing with whisper.cpp base.en', audio_file=path)
             transcript = transcribe(path)
-            set_status('thinking', last_transcript=transcript, partial_transcript=transcript, last_response='', partial_response='', max_output_tokens=QWEN_MAX_TOKENS)
+            set_status('thinking', last_transcript=transcript, partial_transcript=transcript, last_response='', partial_response='', speaking_text='', last_tool_name='', last_tool_result='', last_answer_quality={'enabled': False, 'source': 'internet_god_deferred', 'reason': 'Waiting for Local Jetson Tutor answer; Internet God reviews later.'}, last_system_judge={}, max_output_tokens=QWEN_MAX_TOKENS)
             log_event('transcript', transcript or '(blank)', audio_file=path)
         if not transcript:
             set_status('idle', last_error='Blank audio / no speech detected')
@@ -1639,6 +2024,11 @@ def cleanup_orphan_arecord_processes():
 
 def main():
     cleanup_orphan_arecord_processes()
+    update_weak_answer_state()
+    update_qa_review_state()
+    with lock:
+        state['kb_item_count'] = len(load_kb_items())
+        save_state()
     set_status('idle')
     threading.Thread(target=tts_worker, daemon=True).start()
     threading.Thread(target=command_loop, daemon=True).start()

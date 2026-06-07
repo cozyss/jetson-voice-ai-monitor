@@ -50,3 +50,15 @@ When the device later has internet access, an online agent reviews the queued we
 ## Scope boundary
 
 Self-improvement is intentionally limited to the **knowledge base**. The system should not automatically rewrite arbitrary code, change safety policies, or update model weights. The goal is to make offline tutoring coverage better for the real questions students ask, while keeping the device understandable and safe to operate.
+
+## Latest implementation notes
+
+The current daemon implements the self-improvement loop as a knowledge-base loop, not a model fine-tuning loop:
+
+1. The Local Jetson Tutor answers first from the local Qwen server and any local KB snippets.
+2. Each Q&A turn can be saved into `qa_review_queue.json`.
+3. Weak or missing answers are tracked in `weak_answers.json`.
+4. When the operator chooses **Connect to Internet + Review Q&A + Enrich KB**, the online judge reviews saved Q&A, records a judgment, and writes useful snippets into `knowledge_base/kb_items.json`.
+5. Later offline answers retrieve relevant local KB notes before prompting Qwen.
+
+The dashboard exposes the review queue, unresolved knowledge gaps, enriched KB items, and delete controls for demo/reset workflows. Runtime JSON files are deliberately ignored by git; see `examples/` for sample file shapes.

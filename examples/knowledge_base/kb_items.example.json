@@ -1,0 +1,21 @@
+[
+  {
+    "id": "kb-example-photosynthesis",
+    "ts": "2026-06-07T00:00:00+00:00",
+    "status": "active",
+    "query": "photosynthesis school definition sunlight carbon dioxide water glucose oxygen",
+    "question": "What is photosynthesis? Explain it for a school student.",
+    "weak_answer_id": "weak-example-001",
+    "missing_knowledge": "basic photosynthesis definition, inputs, outputs, and why plants need sunlight",
+    "suggested_improvement": "Add concise school-level notes about photosynthesis, chlorophyll, sunlight, water, carbon dioxide, glucose, and oxygen.",
+    "snippets": [
+      {
+        "source": "curated",
+        "title": "Photosynthesis basics",
+        "source_url": "offline-seed",
+        "text": "Photosynthesis is how green plants use sunlight, water, and carbon dioxide to make glucose, a sugar they use for energy and growth. Oxygen is released as a byproduct. Chlorophyll in leaves helps capture sunlight."
+      }
+    ],
+    "errors": []
+  }
+]

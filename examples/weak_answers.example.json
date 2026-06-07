@@ -1,0 +1,12 @@
+[
+  {
+    "id": "weak-example-001",
+    "ts": "2026-06-07T00:00:00+00:00",
+    "status": "pending",
+    "question": "What is photosynthesis?",
+    "answer": "It is something plants do.",
+    "score": 0.42,
+    "reason": "Too vague for a school student; missing inputs and outputs.",
+    "missing_knowledge": "sunlight, water, carbon dioxide, glucose, oxygen"
+  }
+]
