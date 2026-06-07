@@ -1,0 +1,8 @@
+[
+  {
+    "id": "noise-1234",
+    "ts": "2026-06-07T12:00:00Z",
+    "text": "background noise / accidental input",
+    "reason": "too short or not a student question"
+  }
+]

@@ -1,64 +1,49 @@
 # Self-improving knowledge-base loop
 
-Self-improving Jetson Tutor is designed for students who can physically access the device but may not have internet. The local Qwen model must be strong enough to answer from the available offline knowledge base, but it also needs a way to admit when the local knowledge base is missing coverage.
+Self-improving Jetson Tutor is not a model-fine-tuning project. It is a practical offline education loop: answer now with a local model, preserve the local Q&A trace, and use occasional internet access to enrich the local knowledge base for future offline use.
 
-## Offline behavior
+## Offline-first behavior
 
-For every student question:
+For each student question, the daemon:
 
-1. Transcribe the question locally.
-2. Retrieve or reference local educational knowledge-base material when available.
-3. Generate an answer with the local Qwen model.
-4. Ask the local model to judge the answer quality.
-5. If the answer is weak, save an improvement record.
+1. Captures voice or typed input.
+2. Transcribes voice locally with `whisper.cpp`.
+3. Retrieves relevant local KB notes from `knowledge_base/kb_items.json`.
+4. Prompts local Qwen through the Jetson `llama.cpp` server.
+5. Speaks the answer with Piper.
+6. Saves the question and answer to `qa_review_queue.json` for later review.
+7. Tracks weak/gap items in `weak_answers.json` when an answer or topic needs follow-up.
 
-A weak answer can mean:
+The local Qwen prompt tells the tutor to be honest when it is uncertain and to prefer enriched KB notes when they are relevant. This keeps normal use fully available even without internet.
 
-- The model is uncertain.
-- The answer is too vague or incomplete.
-- The answer depends on facts not present in the local knowledge base.
-- The student asked a topic the current knowledge base does not cover.
-- The model could not explain the concept at the right level.
+## Online review behavior
 
-## Improvement queue
+When an operator presses **Connect to Internet + Review Q&A + Enrich KB**, and online judging is configured, the daemon:
 
-The queue should preserve enough information to improve later without requiring the student to repeat themselves:
+1. Opens a short "internet session" state for the dashboard.
+2. Loads pending saved Q&A records.
+3. Sends each Q&A to the configured online judge.
+4. Asks for compact JSON: score, whether enrichment is needed, reason, missing knowledge, suggested improvement, search query, and a concise `teacher_note`.
+5. Marks good answers as reviewed.
+6. Writes missing facts, corrections, guidance, and external/source-backed context into `knowledge_base/kb_items.json` for answers that need improvement.
+7. Leaves all generated enrichment local so later offline prompts can use it.
 
-```json
-{
-  "question": "student's original question",
-  "answer_summary": "what the tutor answered",
-  "self_judgment": "why the answer was not good enough",
-  "missing_topics": ["topic or curriculum area"],
-  "timestamp": "local device time"
-}
-```
+The latest prompt is tuned for spoken tutoring: a good answer may be short if it is accurate, clear, age-appropriate, and easy to hear.
 
-The prototype already exposes weak-answer / self-improvement state in the dashboard and keeps runtime artifacts out of git.
+## Runtime files
 
-## Online behavior
+- `qa_review_queue.json` — all saved local questions/answers plus optional Internet God judgments.
+- `weak_answers.json` — unresolved weak-answer or knowledge-gap records.
+- `knowledge_base/kb_items.json` — enriched local facts, teacher notes, corrections, source snippets, and guidance.
+- `nonsense_inputs.json` — filtered noise or accidental input records that should not pollute the learning queue.
+- `conversation.json` — short rolling context for continuity.
 
-When the device later has internet access, an online agent reviews the queued weak-answer records and creates a knowledge-base enrichment request. The online step should:
+These are runtime artifacts and are not committed. Sample shapes are in `examples/`.
 
-1. Group similar student questions.
-2. Identify missing curriculum topics.
-3. Download, summarize, or transform reliable educational resources.
-4. Store the new material in the local knowledge base.
-5. Mark the queue items as addressed.
-6. Keep generated sources/metadata local so future offline answers can cite or ground against them.
+## Safety boundary
 
-## Scope boundary
+Self-improvement is deliberately constrained to the **knowledge base**. The system does not automatically update model weights, change safety policy, or rewrite arbitrary code as part of the educational learning loop. That makes demos auditable and makes future classroom deployments easier to reason about.
 
-Self-improvement is intentionally limited to the **knowledge base**. The system should not automatically rewrite arbitrary code, change safety policies, or update model weights. The goal is to make offline tutoring coverage better for the real questions students ask, while keeping the device understandable and safe to operate.
+## Why this loop fits constrained education
 
-## Latest implementation notes
-
-The current daemon implements the self-improvement loop as a knowledge-base loop, not a model fine-tuning loop:
-
-1. The Local Jetson Tutor answers first from the local Qwen server and any local KB snippets.
-2. Each Q&A turn can be saved into `qa_review_queue.json`.
-3. Weak or missing answers are tracked in `weak_answers.json`.
-4. When the operator chooses **Connect to Internet + Review Q&A + Enrich KB**, the online judge reviews saved Q&A, records a judgment, and writes useful snippets into `knowledge_base/kb_items.json`.
-5. Later offline answers retrieve relevant local KB notes before prompting Qwen.
-
-The dashboard exposes the review queue, unresolved knowledge gaps, enriched KB items, and delete controls for demo/reset workflows. Runtime JSON files are deliberately ignored by git; see `examples/` for sample file shapes.
+Afghan girls are the motivating use case because the access problem is severe and connectivity cannot be assumed. A device that only works online fails precisely when it may be most needed. A device that learns from student questions while offline, then uses rare connectivity windows to improve local teacher notes, is more resilient and better aligned with rural, low-bandwidth, or restricted-learning environments.

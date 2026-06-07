@@ -97,6 +97,9 @@ _system_judge_net_cache = {'ts': 0.0, 'ok': False}
 # internet is available, then used ONLY to enrich the local knowledge base.
 WEAK_ANSWERS = os.path.join(BASE, 'weak_answers.json')
 QA_REVIEW_LOG = os.path.join(BASE, 'qa_review_queue.json')
+NONSENSE_INPUT_LOG = os.path.join(BASE, 'nonsense_inputs.json')
+NONSENSE_INPUT_MAX_ITEMS = int(os.environ.get('VOICE_NONSENSE_INPUT_MAX_ITEMS', '200'))
+INPUT_FILTER_ENABLED = os.environ.get('VOICE_INPUT_FILTER_ENABLED', '1') != '0'
 QA_REVIEW_MAX_ITEMS = int(os.environ.get('VOICE_QA_REVIEW_MAX_ITEMS', '200'))
 KB_DIR = os.path.join(BASE, 'knowledge_base')
 KB_FILE = os.path.join(KB_DIR, 'kb_items.json')
@@ -148,10 +151,16 @@ state = {
     'last_answer_quality': {'enabled': False, 'source': 'internet_god_deferred', 'reason': 'Local tutor does not judge its own answers; Internet God reviews saved Q&A on connect.'},
     'qa_review_count': 0,
     'qa_review_list': [],
+    'input_filter_enabled': INPUT_FILTER_ENABLED,
+    'nonsense_input_count': 0,
+    'nonsense_input_list': [],
+    'last_input_filter': {},
     'weak_answer_count': 0,
     'weak_answer_list': [],
     'connectivity_mode': CONNECTIVITY_MODE,
     'last_internet_review': {},
+    'internet_session_active': False,
+    'internet_status_label': 'Internet unavailable / offline by default',
     'kb_enabled': KB_ENABLED,
     'kb_item_count': 0,
     'kb_last_enrichment': {},
@@ -435,8 +444,29 @@ def tts_worker():
 
 def queue_speech(text, voice='assistant'):
     text = clean_for_speech(text)
-    if text:
-        tts_queue.put({'text': text, 'voice': voice or 'assistant'})
+    voice = voice or 'assistant'
+    if not text:
+        return
+    # Local Jetson Tutor final answers should never get stuck behind a backlog of
+    # Internet God/status messages. If a system message is already playing we let
+    # it finish, but we move the assistant's complete final answer to the front of
+    # the pending queue.
+    if voice == 'assistant':
+        try:
+            pending = []
+            while True:
+                try:
+                    pending.append(tts_queue.get_nowait())
+                    tts_queue.task_done()
+                except queue.Empty:
+                    break
+            tts_queue.put({'text': text, 'voice': 'assistant'})
+            for item in pending:
+                tts_queue.put(item)
+            return
+        except Exception as e:
+            log_event('tts_queue_priority_error', str(e))
+    tts_queue.put({'text': text, 'voice': voice})
 
 def queue_system_speech(text):
     if SYSTEM_JUDGE_TTS:
@@ -584,7 +614,7 @@ You have a tool named get_current_weather for current weather by city/place. Use
 You may have a self_improve tool for device/code bugs, but offline education learning gaps are NOT code self-improvements: weak school answers are saved to a knowledge-base enrichment queue and refreshed when internet is available.
 Use tools proactively. Do not say you lack the ability to ping, inspect the system, run Python, check weather, or run local commands; call run_shell_command, run_python_code, or get_current_weather instead. Do not ask for confirmation before ordinary local read-only/status commands.
 If a tool is useful, call it silently; do not narrate tool calls or mention internal tool syntax.
-When relevant local knowledge-base notes are provided, use them as supporting offline educational context.
+Before answering, always check the relevant local enriched knowledge-base notes that the daemon provides. If those notes are relevant, prefer them over your older model memory so answers stay up to date. The KB may include Internet God review notes, missing knowledge, and suggested improvements; use those teacher notes even if web snippets are noisy. If no relevant KB notes are provided, answer from local knowledge and the turn will still be saved for later Internet God review.
 After tool results are returned, give only the final user-facing spoken answer."""
 
 def run_note_tool_use(arguments):
@@ -1174,12 +1204,15 @@ def internet_god_review_qa(item):
     if not system_judge_internet_available():
         raise RuntimeError('Internet is not available for Internet God review')
     prompt = (
-        "You are Internet God reviewing an offline Local Jetson Tutor answer for Afghan girls' education. "
-        "Judge whether the answer is good enough for a student using an offline learning device. "
-        "If the answer is inaccurate, vague, too incomplete, evasive, or missing important educational facts, set needs_enrichment=true and specify exactly what local knowledge-base content should be downloaded. "
-        "If the answer is adequate, set needs_enrichment=false. Scope is ONLY knowledge-base enrichment; do not request code, tools, device features, or behavior changes. "
-        "Return ONLY compact JSON with keys: needs_enrichment boolean, score number 0..1, reason string, missing_knowledge string, suggested_improvement string, search_query string.\n\n"
-        f"Question:\n{(item.get('question') or '')[:2200]}\n\nLocal Jetson Tutor answer:\n{(item.get('answer') or '')[:2600]}"
+        "You are Internet God reviewing a Local Jetson Tutor answer for Afghan girls using a school speech system. "
+        "The child hears the answer aloud, so the ideal answer is accurate, clear, concise, age-appropriate, and easy to say/listen to. "
+        "Do NOT demand a long textbook explanation or advanced detail. A good spoken answer may be only 1-3 short sentences if it answers the question correctly. "
+        "Mark needs_enrichment=false when the answer is factually correct, understandable for school children, and complete enough for a short spoken tutoring reply. "
+        "Mark needs_enrichment=true when the answer is wrong, misleading, too vague to teach the concept, missing a key school-level fact, or too confusing/overly complex for children. "
+        "When enrichment is needed, specify concrete kid-friendly local knowledge-base content that would help the tutor give a better short spoken answer next time. "
+        "Scope is ONLY knowledge-base enrichment; do not request code, tools, device features, policy changes, or long-form curriculum rewrites. "
+        "Return ONLY compact JSON with keys: needs_enrichment boolean, score number 0..1, reason string, missing_knowledge string, suggested_improvement string, search_query string, teacher_note string. The teacher_note MUST be a concise corrected answer or correction rule for next time, maximum 35 words, written for a school child hearing it aloud.\n\n"
+        f"Question:\n{(item.get('question') or '')[:2200]}\n\nComplete Local Jetson Tutor answer:\n{(item.get('answer') or '')[:3200]}"
     )
     payload = {
         'model': SYSTEM_JUDGE_MODEL,
@@ -1240,9 +1273,92 @@ def save_kb_items(items):
         save_state()
 
 def simple_terms(text):
-    stop=set('the a an and or but is are was were be been being to of in on for from with by about what why how when where who whom which explain tell me please girl girls student students'.split())
+    stop=set('the a an and or but is are was were be been being to of in on for from with by about what why how when where who whom which explain tell me please girl girls student students answer answers answered reply respond say one short sentence concise test marker fix kb local tutor jetson'.split())
     words=re.findall(r"[a-zA-Z][a-zA-Z0-9'-]{2,}", (text or '').lower())
     return [w for w in words if w not in stop][:40]
+
+
+def load_nonsense_inputs():
+    try:
+        with open(NONSENSE_INPUT_LOG) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log_event('input_filter_error', 'Could not load nonsense input log: ' + str(e))
+        return []
+
+def save_nonsense_inputs(items):
+    items = list(items or [])[-NONSENSE_INPUT_MAX_ITEMS:]
+    tmp = f"{NONSENSE_INPUT_LOG}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, 'w') as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, NONSENSE_INPUT_LOG)
+    with lock:
+        state['nonsense_input_count'] = len(items)
+        state['nonsense_input_list'] = list(reversed(items[-8:]))
+        save_state()
+
+def classify_user_input(text):
+    """Return (usable, reason). Deterministic pre-Qwen filter for bad STT/gibberish."""
+    if not INPUT_FILTER_ENABLED:
+        return True, 'filter disabled'
+    raw = (text or '').strip()
+    low = raw.lower().strip()
+    if not raw:
+        return False, 'blank input'
+    bracket_only = re.sub(r'\[[^\]]+\]', ' ', raw).strip()
+    if not bracket_only:
+        return False, 'only whisper noise markers'
+    noise_markers = ('[blank_audio]', '[inaudible]', '[silence]', '[ silence ]', '[typing]', '[interposing voices]')
+    marker_hits = sum(1 for m in noise_markers if m in low)
+    alpha_words = re.findall(r"[A-Za-z][A-Za-z']*", raw)
+    real_words = [w for w in alpha_words if len(w) >= 2]
+    letters = sum(c.isalpha() for c in raw)
+    if marker_hits and len(real_words) < 3:
+        return False, 'mostly audio/noise markers'
+    if letters < 4:
+        return False, 'too little speech text'
+    if len(real_words) == 1 and len(real_words[0]) < 5:
+        return False, 'single short unclear word'
+    if len(real_words) <= 2:
+        # Allow common concise commands/questions, reject random fragments.
+        allowed = set('yes no stop start weather time date hello hi thanks thank you help repeat explain why how what who where when'.split())
+        if not any(w.lower() in allowed for w in real_words) and '?' not in raw:
+            return False, 'too short / unclear fragment'
+    normalized = re.sub(r'[^a-z]+', '', low)
+    if len(normalized) >= 8:
+        # reject character-level repetition like "aaaaaaa" or "blah blah blah"-style nonsense
+        most = max((normalized.count(ch) for ch in set(normalized)), default=0)
+        if most / max(1, len(normalized)) > 0.72:
+            return False, 'repetitive gibberish'
+    if re.search(r'(?i)\b(inaudible|blank_audio|silence|typing|interposing voices)\b', raw) and len(real_words) < 5:
+        return False, 'transcription appears unreliable'
+    return True, 'usable'
+
+def record_nonsense_input(text, reason, source='input', audio_file=''):
+    rec = {'id': 'bad-' + uuid.uuid4().hex[:8], 'ts': now(), 'text': (text or '').strip(), 'reason': reason, 'source': source, 'audio_file': audio_file or '', 'status': 'ignored_not_sent_to_qwen_or_internet_god'}
+    items = load_nonsense_inputs()
+    items.append(rec)
+    save_nonsense_inputs(items)
+    with lock:
+        state['last_input_filter'] = rec
+        state['last_error'] = 'Ignored unclear input: ' + reason
+        save_state()
+    log_event('input_filtered', rec['text'][:500] or '(blank)', reason=reason, source=source, audio_file=audio_file or '', id=rec['id'])
+    return rec
+
+def should_process_user_input(text, source='input', audio_file=''):
+    ok, reason = classify_user_input(text)
+    if ok:
+        with lock:
+            state['last_input_filter'] = {'ok': True, 'reason': reason, 'text': (text or '').strip()[:500], 'source': source, 'ts': now()}
+            save_state()
+        return True
+    record_nonsense_input(text, reason, source=source, audio_file=audio_file)
+    set_status('idle', last_response='', partial_response='', speaking_text='', last_answer_quality={'enabled': False, 'source': 'input_filter', 'reason': 'Input was ignored before Local Jetson Tutor and Internet God review.'})
+    return False
 
 def derive_kb_query(item):
     base = (item.get('search_query') or item.get('missing_knowledge') or item.get('suggested_improvement') or item.get('question') or '').strip()
@@ -1286,31 +1402,66 @@ def fetch_kb_for_weak_answer(item):
         except Exception as e:
             snippets.append({'source':'fetch_error','title':'Wikipedia fetch failed','source_url':'','text':str(e)[:300]})
     good=[x for x in snippets if x.get('text') and x.get('source') != 'fetch_error']
-    return {'id':'kb-'+str(uuid.uuid4())[:8], 'ts':now(), 'status':'active', 'query':query, 'question':item.get('question',''), 'weak_answer_id':item.get('id',''), 'missing_knowledge':item.get('missing_knowledge',''), 'suggested_improvement':item.get('suggested_improvement',''), 'snippets':good[:8], 'errors':[x for x in snippets if x.get('source')=='fetch_error'][:3]}
+    teacher_note = (item.get('teacher_note') or item.get('corrected_answer') or item.get('suggested_improvement') or item.get('missing_knowledge') or '').strip()
+    previous_answer = (item.get('answer') or '').strip()
+    feedback = (item.get('reason') or '').strip()
+    return {'id':'kb-'+str(uuid.uuid4())[:8], 'ts':now(), 'status':'active', 'query':query, 'question':item.get('question',''), 'weak_answer_id':item.get('id',''), 'qa_review_id': item.get('qa_review_id',''), 'previous_answer': previous_answer, 'internet_god_feedback': feedback, 'teacher_note': teacher_note, 'missing_knowledge':item.get('missing_knowledge',''), 'suggested_improvement':item.get('suggested_improvement',''), 'snippets':good[:6], 'errors':[x for x in snippets if x.get('source')=='fetch_error'][:3]}
 
 def load_kb_context(question):
     if not KB_ENABLED:
         return ''
     items=load_kb_items()
-    with lock:
-        state['kb_item_count'] = len(items)
-        save_state()
     if not items:
+        with lock:
+            state['kb_item_count'] = 0
+            state['last_kb_context_used'] = False
+            state['last_kb_context_count'] = 0
+            state['last_kb_context_items'] = []
+            save_state()
         return ''
     qterms=set(simple_terms(question))
+    qnorm=re.sub(r'[^a-z0-9]+','', (question or '').lower())
     scored=[]
     for it in items:
-        hay=' '.join([it.get('query',''), it.get('question',''), it.get('missing_knowledge',''), ' '.join((sn.get('title','')+' '+sn.get('text','')) for sn in it.get('snippets',[])[:3])]).lower()
+        hay=' '.join([
+            it.get('query',''), it.get('question',''), it.get('teacher_note',''), it.get('previous_answer',''), it.get('internet_god_feedback',''), it.get('missing_knowledge',''), it.get('suggested_improvement',''),
+            ' '.join((sn.get('title','')+' '+sn.get('text','')) for sn in it.get('snippets',[])[:5])
+        ]).lower()
         score=sum(1 for t in qterms if t in hay)
-        if score>0: scored.append((score,it))
+        # Handle common speech/STT spacing like "photo synthesis" vs "photosynthesis" without relying on set ordering.
+        compact_hay=re.sub(r'[^a-z0-9]+','', hay)
+        if qnorm and (qnorm in compact_hay or compact_hay.find(qnorm) >= 0):
+            score += 5
+        if 'photo' in qterms and 'synthesis' in qterms and 'photosynthesis' in compact_hay:
+            score += 8
+        if score>0:
+            scored.append((score,it))
     scored.sort(key=lambda x:x[0], reverse=True)
     chunks=[]
-    for _,it in scored[:4]:
-        for sn in (it.get('snippets') or [])[:3]:
+    used=[]
+    for score,it in scored[:4]:
+        used.append({'id': it.get('id',''), 'query': it.get('query',''), 'score': score})
+        teacher=[]
+        if it.get('question'): teacher.append('Original question: ' + it.get('question',''))
+        if it.get('teacher_note'): teacher.append('CONCISE TEACHER CORRECTION TO USE FIRST: ' + it.get('teacher_note',''))
+        if it.get('previous_answer'): teacher.append('Previous weak answer to avoid repeating: ' + it.get('previous_answer','')[:350])
+        if it.get('internet_god_feedback'): teacher.append('Internet God feedback on previous answer: ' + it.get('internet_god_feedback','')[:350])
+        if it.get('missing_knowledge'): teacher.append('Missing knowledge: ' + it.get('missing_knowledge',''))
+        if it.get('suggested_improvement'): teacher.append('Suggested answer improvement: ' + it.get('suggested_improvement',''))
+        if teacher:
+            chunks.append(f"KB item {it.get('id','')} topic {it.get('query','')}: " + ' | '.join(teacher)[:1400])
+        for sn in (it.get('snippets') or [])[:2]:
             txt=(sn.get('text') or '').strip()
-            if txt: chunks.append(f"Title: {sn.get('title','')}; Source: {sn.get('source','')}; Notes: {txt[:700]}")
-    return '\n'.join(chunks)[:KB_MAX_CONTEXT_CHARS]
-
+            if txt:
+                chunks.append(f"KB item {it.get('id','')}; Topic: {it.get('query','')}; Title: {sn.get('title','')}; Source: {sn.get('source','')}; Notes: {txt[:650]}")
+    context='\n'.join(chunks)[:KB_MAX_CONTEXT_CHARS]
+    with lock:
+        state['kb_item_count'] = len(items)
+        state['last_kb_context_used'] = bool(context)
+        state['last_kb_context_count'] = len(used)
+        state['last_kb_context_items'] = used[:4]
+        save_state()
+    return context
 
 def is_exact_reply_request(question, answer):
     q = (question or '').strip()
@@ -1458,13 +1609,18 @@ def build_weak_answer_improvement_request(pending):
 
 def process_weak_answer_backlog(source='internet_demo'):
     try:
+        with lock:
+            state['internet_session_active'] = True
+            state['internet_status_label'] = 'Internet God connected for review'
+            state['connectivity_mode'] = 'internet_review_active'
+            save_state()
         qa_items = load_qa_review_items(); pending_qa = pending_qa_review_items(qa_items)
         legacy_items = load_weak_answers(); legacy_pending = pending_weak_answers(legacy_items)
         queue_system_speech('Now you are connecting to the Internet, and Internet God is reviewing the saved questions and answers to update the knowledge base.')
         if not pending_qa and not legacy_pending:
             review = {'ok': True, 'source': source, 'qa_reviewed': 0, 'kb_items_added': 0, 'message': 'No saved Q&A turns need Internet God review.', 'scope': 'knowledge_base_only'}
             with lock:
-                state['last_internet_review'] = review; state['connectivity_mode'] = CONNECTIVITY_MODE; state['kb_item_count'] = len(load_kb_items()); save_state()
+                state['last_internet_review'] = review; state['connectivity_mode'] = CONNECTIVITY_MODE; state['internet_session_active'] = False; state['internet_status_label'] = 'Internet unavailable / offline by default'; state['kb_item_count'] = len(load_kb_items()); save_state()
             update_qa_review_state(qa_items); update_weak_answer_state(legacy_items)
             log_event('internet_review', review['message'], pending=0, source=source)
             queue_system_speech('No saved questions and answers need review right now.')
@@ -1488,12 +1644,13 @@ def process_weak_answer_backlog(source='internet_demo'):
                         'score': verdict.get('score'), 'reason': verdict.get('reason',''),
                         'missing_knowledge': verdict.get('missing_knowledge',''),
                         'suggested_improvement': verdict.get('suggested_improvement',''),
+                        'teacher_note': verdict.get('teacher_note','') or verdict.get('corrected_answer',''),
                         'search_query': verdict.get('search_query',''),
                         'quality': verdict, 'qa_review_id': x.get('id')
                     }
                     kb = fetch_kb_for_weak_answer(weak); kb_items.append(kb)
                     detail.update({'weak_answer_id': weak['id'], 'query': kb.get('query'), 'snippets': len(kb.get('snippets') or []), 'errors': kb.get('errors', [])[:1]})
-                    if kb.get('snippets'):
+                    if kb.get('snippets') or kb.get('teacher_note') or kb.get('suggested_improvement'):
                         enriched += 1; cleared_qa.add(x.get('id')); x['status'] = 'reviewed'
                     else:
                         failed += 1; new_unresolved.append(weak); x['status'] = 'reviewed_unresolved'
@@ -1508,7 +1665,7 @@ def process_weak_answer_backlog(source='internet_demo'):
             try:
                 kb = fetch_kb_for_weak_answer(x); kb_items.append(kb)
                 detail = {'weak_answer_id': x.get('id'), 'query': kb.get('query'), 'snippets': len(kb.get('snippets') or []), 'errors': kb.get('errors', [])[:1], 'legacy': True}
-                if kb.get('snippets'):
+                if kb.get('snippets') or kb.get('teacher_note') or kb.get('suggested_improvement'):
                     enriched += 1; cleared_legacy.add(x.get('id'))
                 else:
                     failed += 1
@@ -1538,14 +1695,14 @@ def process_weak_answer_backlog(source='internet_demo'):
             'message': f'Internet God reviewed {reviewed} Q&A turns and added {enriched} KB items.'
         }
         with lock:
-            state['last_internet_review'] = review; state['kb_last_enrichment'] = review; state['kb_item_count'] = len(load_kb_items()); state['connectivity_mode'] = CONNECTIVITY_MODE; save_state()
+            state['last_internet_review'] = review; state['kb_last_enrichment'] = review; state['kb_item_count'] = len(load_kb_items()); state['connectivity_mode'] = CONNECTIVITY_MODE; state['internet_session_active'] = False; state['internet_status_label'] = 'Internet unavailable / offline by default'; save_state()
         log_event('internet_god_qa_review', review['message'], qa_reviewed=reviewed, enriched=enriched, failed=failed, source=source)
         queue_system_speech(f'Internet God reviewed {reviewed} saved answers and added {enriched} knowledge base updates.')
         return review
     except Exception as e:
         review = {'ok': False, 'source': source, 'error': str(e), 'scope': 'knowledge_base_only'}
         with lock:
-            state['last_internet_review'] = review; state['last_error'] = str(e); save_state()
+            state['last_internet_review'] = review; state['last_error'] = str(e); state['internet_session_active'] = False; state['internet_status_label'] = 'Internet unavailable / offline by default'; state['connectivity_mode'] = CONNECTIVITY_MODE; save_state()
         log_event('internet_review_error', str(e), source=source)
         return review
 
@@ -1737,9 +1894,28 @@ def ask_qwen(text):
         save_state()
     history_messages = trim_history(load_history())
     kb_context = load_kb_context(text)
+    # KB must be allowed to change the answer. If relevant KB exists, do not pass
+    # prior chat history, because old Q&A turns can make the model repeat a stale
+    # pre-enrichment answer. If no KB exists, filter near-duplicate prior turns so
+    # deleting a KB item can also change the answer to the same question.
+    if kb_context:
+        history_messages = []
+    else:
+        cur_terms = set(simple_terms(text))
+        filtered = []
+        for hm in history_messages:
+            terms = set(simple_terms(hm.get('content','')))
+            overlap = len(cur_terms & terms)
+            denom = max(1, min(len(cur_terms), len(terms)))
+            if overlap / denom >= 0.75:
+                continue
+            filtered.append(hm)
+        history_messages = filtered
     system_prompt = VOICE_SYSTEM_PROMPT
     if kb_context:
-        system_prompt += '\n\nRelevant local offline knowledge-base notes (use these to answer student questions; cite plainly if helpful):\n' + kb_context
+        system_prompt += '\n\nAUTHORITATIVE LOCAL ENRICHED KNOWLEDGE BASE NOTES FOR THIS QUESTION:\n' + kb_context + '\n\nKB RULES: The notes above were added by Internet God after reviewing earlier answers. For this turn, they are newer and more important than your base model memory and chat history. Your answer MUST use the KB teacher correction first, before base-model memory. Do not repeat the previous weak answer. Keep it spoken and concise, but make the answer visibly improved by including the correction or missing fact from the KB.'
+    else:
+        system_prompt += '\n\nNo relevant enriched local KB note matched this question. Answer from the local model only. Do not copy a previous answer to the same question from memory/history; give the best fresh local answer.'
     messages = [{'role':'system','content': system_prompt}] + history_messages + [
         {'role':'user','content': text}
     ]
@@ -1787,7 +1963,7 @@ def ask_qwen(text):
         break
     if not response:
         response = 'I ran the tool, but I could not produce a final answer.'
-    response = polish_spoken_response(text, response)
+    response = response if kb_context else polish_spoken_response(text, response)
     with lock:
         state['partial_response'] = response
         state['last_response'] = response
@@ -1795,7 +1971,7 @@ def ask_qwen(text):
     speak_final_response(response)
     append_history_turn(text, response)
     quality = record_qa_for_internet_review(text, response, {'system_judge': judge, 'rounds': len(raw_rounds)})
-    return response, {'tool_calling': TOOL_CALLING_ENABLED, 'system_judge': judge, 'answer_quality': quality, 'force_tool_each_turn': FORCE_TOOL_EACH_TURN, 'forced_tool_used': forced_tool_used, 'rounds': len(raw_rounds), 'history_messages': len(history_messages), 'kb_context_used': bool(kb_context)}
+    return response, {'tool_calling': TOOL_CALLING_ENABLED, 'system_judge': judge, 'answer_quality': quality, 'force_tool_each_turn': FORCE_TOOL_EACH_TURN, 'forced_tool_used': forced_tool_used, 'rounds': len(raw_rounds), 'history_messages': len(history_messages), 'kb_context_used': bool(kb_context), 'kb_context_count': state.get('last_kb_context_count', 0), 'kb_context_items': state.get('last_kb_context_items', [])}
 
 def live_transcribe_loop(session_id, path):
     # Periodically transcribe a snapshot of the growing WAV while the button is still held/recording.
@@ -1840,6 +2016,8 @@ def process_text(transcript, source='text'):
         if not transcript:
             set_status('idle', last_error='Blank text command')
             return
+        if not should_process_user_input(transcript, source=source):
+            return
         set_status('thinking', last_transcript=transcript, last_response='', partial_response='', speaking_text='', last_tool_name='', last_tool_result='', last_answer_quality={'enabled': False, 'source': 'internet_god_deferred', 'reason': 'Waiting for Local Jetson Tutor answer; Internet God reviews later.'}, last_system_judge={}, max_output_tokens=QWEN_MAX_TOKENS)
         log_event('thinking', 'Sending text to Qwen', source=source, text=transcript[:300])
         response, raw = ask_qwen(transcript)
@@ -1868,6 +2046,8 @@ def process_audio(path):
             log_event('transcript', transcript or '(blank)', audio_file=path)
         if not transcript:
             set_status('idle', last_error='Blank audio / no speech detected')
+            return
+        if not should_process_user_input(transcript, source='voice', audio_file=path):
             return
         log_event('thinking', 'Sending transcript to Qwen')
         response, raw = ask_qwen(transcript)
@@ -2000,6 +2180,21 @@ def key_loop():
             log_event('timeout', 'Max recording time reached; stopping automatically')
             stop_recording('timeout')
 
+
+def reset_transient_state_on_startup():
+    # After a crash/restart, never leave the UI stuck in recording/transcribing/thinking.
+    with lock:
+        if state.get('status') in ('recording','transcribing','thinking','responding','speaking','error'):
+            state['status'] = 'idle'
+        state['recording_seconds'] = 0
+        state['recording_file'] = None
+        state['partial_transcript'] = ''
+        state['partial_response'] = ''
+        state['speaking'] = False
+        state['speaking_text'] = ''
+        state['last_error'] = ''
+        save_state()
+
 def cleanup_orphan_arecord_processes():
     # Daemon restarts can leave an old arecord holding the mic; clear only our recording jobs.
     try:
@@ -2024,6 +2219,7 @@ def cleanup_orphan_arecord_processes():
 
 def main():
     cleanup_orphan_arecord_processes()
+    reset_transient_state_on_startup()
     update_weak_answer_state()
     update_qa_review_state()
     with lock:
