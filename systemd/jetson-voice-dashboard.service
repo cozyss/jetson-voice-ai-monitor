@@ -1,0 +1,16 @@
+[Unit]
+Description=Jetson Voice AI Monitor dashboard
+After=network-online.target jetson-voice-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/workspace/jetson-voice-ai-monitor
+EnvironmentFile=-/workspace/jetson-voice-ai-monitor/.env
+Environment=PYTHONPATH=/workspace/jetson-voice-ai-monitor/src
+ExecStart=/usr/bin/python3 -m jetson_voice_ai_monitor.dashboard
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

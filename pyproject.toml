@@ -1,0 +1,25 @@
+[project]
+name = "jetson-voice-ai-monitor"
+version = "0.1.0"
+description = "Offline-first voice AI monitor for NVIDIA Jetson: press-to-talk audio, Whisper STT, local Qwen via llama.cpp, Piper TTS, and a live dashboard."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "cozyss"}]
+keywords = ["jetson", "voice-ai", "qwen", "whisper", "piper", "llama.cpp", "edge-ai", "hackathon"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.scripts]
+jetson-voice-daemon = "jetson_voice_ai_monitor.voice_daemon:main"
+jetson-voice-dashboard = "jetson_voice_ai_monitor.dashboard:main"
+jetson-voice-say = "jetson_voice_ai_monitor.say_status:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

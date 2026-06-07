@@ -1,0 +1,1649 @@
+#!/usr/bin/env python3
+import os, sys, time, json, struct, select, subprocess, threading, signal, glob, urllib.request, urllib.error, queue, re, uuid
+from datetime import datetime, timezone
+import tempfile
+
+BASE = os.environ.get('VOICE_AI_BASE', '/workspace/voice-ai')
+SELF_IMPROVE_ENV = os.path.join(BASE, 'self-improve.env')
+try:
+    with open(SELF_IMPROVE_ENV) as _envf:
+        for _line in _envf:
+            _line = _line.strip()
+            if not _line or _line.startswith('#') or '=' not in _line:
+                continue
+            _k, _v = _line.split('=', 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+except FileNotFoundError:
+    pass
+except Exception:
+    pass
+SYSTEM_JUDGE_ENV = os.path.join(BASE, 'system-judge.env')
+try:
+    with open(SYSTEM_JUDGE_ENV) as _envf:
+        for _line in _envf:
+            _line = _line.strip()
+            if not _line or _line.startswith('#') or '=' not in _line:
+                continue
+            _k, _v = _line.split('=', 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+except FileNotFoundError:
+    pass
+except Exception:
+    pass
+STATE = os.path.join(BASE, 'state.json')
+EVENTS = os.path.join(BASE, 'events.jsonl')
+COMMANDS = os.path.join(BASE, 'commands.jsonl')
+HISTORY = os.path.join(BASE, 'conversation.json')
+AUDIO_DIR = os.path.join(BASE, 'recordings')
+WHISPER = os.environ.get('VOICE_WHISPER_BIN', '/workspace/whisper.cpp/build/bin/whisper-cli')
+WHISPER_MODEL = os.environ.get('VOICE_WHISPER_MODEL', '/workspace/models/whisper/ggml-base.en.bin')
+QWEN_URL = os.environ.get('VOICE_QWEN_URL', 'http://127.0.0.1:8083/v1/chat/completions')
+ARECORD_DEVICE = os.environ.get('VOICE_ARECORD_DEVICE', 'plughw:0,0')
+MAX_RECORD_SECONDS = int(os.environ.get('VOICE_MAX_RECORD_SECONDS', '120'))
+QWEN_MAX_TOKENS = int(os.environ.get('VOICE_QWEN_MAX_TOKENS', '1024'))
+TTS_ENABLED = os.environ.get('VOICE_TTS_ENABLED', '1') != '0'
+TTS_CMD = os.environ.get('VOICE_TTS_CMD', 'piper-lessac-high')
+PIPER_BIN = os.environ.get('VOICE_PIPER_BIN', '/workspace/piper/piper/piper')
+PIPER_MODEL = os.environ.get('VOICE_PIPER_MODEL', '/workspace/models/piper/en_US-ryan-high.onnx')
+PIPER_LENGTH_SCALE = os.environ.get('VOICE_PIPER_LENGTH_SCALE', '0.95')
+PIPER_NOISE_SCALE = os.environ.get('VOICE_PIPER_NOISE_SCALE', '0.50')
+PIPER_NOISE_W = os.environ.get('VOICE_PIPER_NOISE_W', '0.60')
+TTS_AUDIO_DEVICE = os.environ.get('VOICE_TTS_AUDIO_DEVICE', 'plughw:0,0')
+SYSTEM_TTS_CMD = os.environ.get('VOICE_SYSTEM_TTS_CMD', 'espeak-robot')
+SYSTEM_ESPEAK_VOICE = os.environ.get('VOICE_SYSTEM_ESPEAK_VOICE', 'en+m3')
+SYSTEM_ESPEAK_SPEED = os.environ.get('VOICE_SYSTEM_ESPEAK_SPEED', '135')
+SYSTEM_ESPEAK_PITCH = os.environ.get('VOICE_SYSTEM_ESPEAK_PITCH', '25')
+SYSTEM_PIPER_MODEL = os.environ.get('VOICE_SYSTEM_PIPER_MODEL', '/workspace/models/piper/en_US-lessac-high.onnx')
+SYSTEM_PIPER_LENGTH_SCALE = os.environ.get('VOICE_SYSTEM_PIPER_LENGTH_SCALE', '0.88')
+SYSTEM_PIPER_NOISE_SCALE = os.environ.get('VOICE_SYSTEM_PIPER_NOISE_SCALE', '0.50')
+SYSTEM_PIPER_NOISE_W = os.environ.get('VOICE_SYSTEM_PIPER_NOISE_W', '0.60')
+LIVE_TRANSCRIBE_ENABLED = os.environ.get('VOICE_LIVE_TRANSCRIBE_ENABLED', '1') != '0'
+LIVE_TRANSCRIBE_INTERVAL = float(os.environ.get('VOICE_LIVE_TRANSCRIBE_INTERVAL', '6'))
+USE_PARTIAL_ON_STOP = os.environ.get('VOICE_USE_PARTIAL_ON_STOP', '0') != '0'
+TOOL_CALLING_ENABLED = os.environ.get('VOICE_TOOL_CALLING_ENABLED', '1') != '0'
+PYTHON_TOOL_TIMEOUT = int(os.environ.get('VOICE_PYTHON_TOOL_TIMEOUT', '20'))
+PYTHON_TOOL_MAX_CHARS = int(os.environ.get('VOICE_PYTHON_TOOL_MAX_CHARS', '4000'))
+PYTHON_TOOL_WORKDIR = os.environ.get('VOICE_PYTHON_TOOL_WORKDIR', os.path.join(BASE, 'python-tool-workdir'))
+SHELL_TOOL_TIMEOUT = int(os.environ.get('VOICE_SHELL_TOOL_TIMEOUT', '30'))
+SHELL_TOOL_MAX_CHARS = int(os.environ.get('VOICE_SHELL_TOOL_MAX_CHARS', '2000'))
+SHELL_TOOL_WORKDIR = os.environ.get('VOICE_SHELL_TOOL_WORKDIR', BASE)
+SELF_IMPROVE_ENABLED = os.environ.get('VOICE_SELF_IMPROVE_ENABLED', '1') != '0'
+SELF_IMPROVE_AGENT_ID = os.environ.get('VOICE_SELF_IMPROVE_AGENT_ID', 'ih7u2H')
+SELF_IMPROVE_API_KEY = os.environ.get('VOICE_SELF_IMPROVE_API_KEY', '')
+SELF_IMPROVE_API_URL = os.environ.get('VOICE_SELF_IMPROVE_API_URL', 'https://staging.sld.dev/api/functions/workspace.agent.notify')
+SELF_IMPROVE_MAX_CHARS = int(os.environ.get('VOICE_SELF_IMPROVE_MAX_CHARS', '2000'))
+HISTORY_TURNS = int(os.environ.get('VOICE_HISTORY_TURNS', '6'))
+HISTORY_MAX_CHARS = int(os.environ.get('VOICE_HISTORY_MAX_CHARS', '6000'))
+HISTORY_ENABLED = os.environ.get('VOICE_HISTORY_ENABLED', '1') != '0'
+FORCE_TOOL_EACH_TURN = os.environ.get('VOICE_FORCE_TOOL_EACH_TURN', '0') != '0'
+SYSTEM_JUDGE_ENABLED = os.environ.get('VOICE_SYSTEM_JUDGE_ENABLED', '0') != '0'
+SYSTEM_JUDGE_MODEL = os.environ.get('VOICE_SYSTEM_JUDGE_MODEL', 'openai/gpt-4o-mini')
+SYSTEM_JUDGE_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
+SYSTEM_JUDGE_URL = os.environ.get('VOICE_SYSTEM_JUDGE_URL', 'https://openrouter.ai/api/v1/chat/completions')
+SYSTEM_JUDGE_TIMEOUT = float(os.environ.get('VOICE_SYSTEM_JUDGE_TIMEOUT', '8'))
+SYSTEM_JUDGE_TTS = os.environ.get('VOICE_SYSTEM_JUDGE_TTS', '1') != '0'
+SYSTEM_JUDGE_MAX_CHARS = int(os.environ.get('VOICE_SYSTEM_JUDGE_MAX_CHARS', '1200'))
+SYSTEM_JUDGE_SPEAK_ALLOW = os.environ.get('VOICE_SYSTEM_JUDGE_SPEAK_ALLOW', 'System check: I can handle that locally.')
+SYSTEM_JUDGE_SPEAK_IMPROVE = os.environ.get('VOICE_SYSTEM_JUDGE_SPEAK_IMPROVE', 'System check: I cannot fully handle that yet. Sending an improvement request.')
+SYSTEM_JUDGE_REQUIRE_INTERNET = os.environ.get('VOICE_SYSTEM_JUDGE_REQUIRE_INTERNET', '1') != '0'
+SYSTEM_JUDGE_NET_PROBE_URL = os.environ.get('VOICE_SYSTEM_JUDGE_NET_PROBE_URL', 'https://openrouter.ai/api/v1/models')
+SYSTEM_JUDGE_NET_PROBE_TIMEOUT = float(os.environ.get('VOICE_SYSTEM_JUDGE_NET_PROBE_TIMEOUT', '1.5'))
+SYSTEM_JUDGE_NET_CACHE_SECONDS = float(os.environ.get('VOICE_SYSTEM_JUDGE_NET_CACHE_SECONDS', '30'))
+SYSTEM_JUDGE_SELF_IMPROVE_MIN_CONFIDENCE = float(os.environ.get('VOICE_SYSTEM_JUDGE_SELF_IMPROVE_MIN_CONFIDENCE', '0.88'))
+_system_judge_net_cache = {'ts': 0.0, 'ok': False}
+
+# Offline education improvement loop: Qwen answers locally, then grades whether
+# the answer was actually useful. Weak answers are stored until internet is
+# available, then converted into one self-improvement request.
+WEAK_ANSWERS = os.path.join(BASE, 'weak_answers.json')
+ANSWER_QUALITY_ENABLED = os.environ.get('VOICE_ANSWER_QUALITY_ENABLED', '1') != '0'
+ANSWER_QUALITY_THRESHOLD = float(os.environ.get('VOICE_ANSWER_QUALITY_THRESHOLD', '0.72'))
+WEAK_ANSWER_MAX_ITEMS = int(os.environ.get('VOICE_WEAK_ANSWER_MAX_ITEMS', '200'))
+CONNECTIVITY_MODE = os.environ.get('VOICE_CONNECTIVITY_MODE', 'connect_to_internet_demo')
+
+os.makedirs(AUDIO_DIR, exist_ok=True)
+lock = threading.RLock()
+record_proc = None
+record_path = None
+record_started = None
+record_session = 0
+state = {
+    'status': 'starting',
+    'mode': 'volume-key-press-to-talk',
+    'instructions': 'Volume Up starts recording; Volume Down stops, transcribes, and sends to Qwen.',
+    'stt': 'whisper.cpp base.en CPU',
+    'llm': 'Qwen3.5-9B-Q4_K_M via FA llama-server',
+    'arecord_device': ARECORD_DEVICE,
+    'last_transcript': '',
+    'partial_transcript': '',
+    'last_response': '',
+    'partial_response': '',
+    'last_error': '',
+    'recording_seconds': 0,
+    'audio_file': '',
+    'tts_enabled': TTS_ENABLED,
+        'tts_cmd': TTS_CMD,
+        'tts_voice': 'Qwen/local answer: male Piper en_US-ryan-high',
+        'tts_system_voice': 'System judge/tool status: nice female Piper en_US-lessac-high',
+    'live_transcribe_enabled': LIVE_TRANSCRIBE_ENABLED,
+    'speaking': False,
+    'speaking_text': '',
+    'max_output_tokens': QWEN_MAX_TOKENS,
+        'tool_calling_enabled': TOOL_CALLING_ENABLED,
+    'force_tool_each_turn': FORCE_TOOL_EACH_TURN,
+    'system_judge_enabled': SYSTEM_JUDGE_ENABLED,
+    'system_judge_model': SYSTEM_JUDGE_MODEL,
+    'system_judge_require_internet': SYSTEM_JUDGE_REQUIRE_INTERNET,
+    'weather_enabled': True,
+    'last_system_judge': {},
+    'answer_quality_enabled': ANSWER_QUALITY_ENABLED,
+    'last_answer_quality': {},
+    'weak_answer_count': 0,
+    'weak_answer_list': [],
+    'connectivity_mode': CONNECTIVITY_MODE,
+    'last_internet_review': {},
+    'self_improve_enabled': SELF_IMPROVE_ENABLED,
+    'conversation_memory_enabled': HISTORY_ENABLED,
+    'history_turns': HISTORY_TURNS,
+    'history_messages': 0,
+        'last_tool_name': '',
+        'last_tool_result': '',
+    'updated_at': '',
+    'event_devices': [],
+}
+
+def now(): return datetime.now(timezone.utc).isoformat()
+
+def save_state():
+    state['updated_at'] = now()
+    tmp = f"{STATE}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, 'w') as f: json.dump(state, f, indent=2)
+    os.replace(tmp, STATE)
+
+def log_event(kind, message, **extra):
+    rec = {'ts': now(), 'kind': kind, 'message': message}
+    rec.update(extra)
+    with open(EVENTS, 'a') as f: f.write(json.dumps(rec) + '\n')
+    with lock:
+        state['last_event'] = rec
+        save_state()
+
+def set_status(status, **kw):
+    with lock:
+        state['status'] = status
+        state.update(kw)
+        save_state()
+
+def load_history():
+    if not HISTORY_ENABLED:
+        return []
+    try:
+        with open(HISTORY) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [m for m in data if isinstance(m, dict) and m.get('role') in ('user', 'assistant') and isinstance(m.get('content'), str)]
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log_event('history_error', f'Could not load conversation history: {e}')
+    return []
+
+def trim_history(messages):
+    clean = []
+    for m in messages:
+        role = m.get('role')
+        content = (m.get('content') or '').strip()
+        if role not in ('user', 'assistant') or not content:
+            continue
+        if len(content) > 1200:
+            content = content[:1200] + '...'
+        clean.append({'role': role, 'content': content})
+    clean = clean[-max(0, HISTORY_TURNS * 2):]
+    total = 0
+    out = []
+    for m in reversed(clean):
+        c = len(m.get('content',''))
+        if out and total + c > HISTORY_MAX_CHARS:
+            break
+        total += c
+        out.append(m)
+    return list(reversed(out))
+
+def save_history(messages):
+    if not HISTORY_ENABLED:
+        return
+    trimmed = trim_history(messages)
+    tmp = f"{HISTORY}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, 'w') as f:
+        json.dump(trimmed, f, indent=2)
+    os.replace(tmp, HISTORY)
+    with lock:
+        state['history_messages'] = len(trimmed)
+        state['conversation_memory_enabled'] = HISTORY_ENABLED
+        state['history_turns'] = HISTORY_TURNS
+        save_state()
+
+def append_history_turn(user_text, assistant_text):
+    if not HISTORY_ENABLED:
+        return
+    user_text = (user_text or '').strip()
+    assistant_text = (assistant_text or '').strip()
+    if not user_text or not assistant_text:
+        return
+    hist = load_history()
+    hist.append({'role': 'user', 'content': user_text})
+    hist.append({'role': 'assistant', 'content': assistant_text})
+    save_history(hist)
+    log_event('history', f'Conversation memory saved: {len(trim_history(hist))} messages')
+
+def discover_event_devices():
+    devices = []
+    cur = {}
+    try:
+        txt = open('/proc/bus/input/devices').read().splitlines()
+    except Exception as e:
+        log_event('error', f'Cannot read input devices: {e}')
+        return []
+    for line in txt + ['']:
+        if not line.strip():
+            if cur.get('handlers'):
+                name = cur.get('name','')
+                handlers = cur.get('handlers','')
+                for h in handlers.split():
+                    if h.startswith('event'):
+                        # Listen to all kbd/consumer devices; filter key codes later.
+                        if ('kbd' in handlers) or ('Consumer Control' in name) or ('EMEET' in name) or ('Logitech' in name):
+                            devices.append({'path': '/dev/input/' + h, 'name': name, 'handlers': handlers})
+            cur = {}
+            continue
+        if line.startswith('N: Name='):
+            cur['name'] = line.split('=',1)[1].strip().strip('"')
+        elif line.startswith('H: Handlers='):
+            cur['handlers'] = line.split('=',1)[1].strip()
+    # Deduplicate by path.
+    seen, out = set(), []
+    for d in devices:
+        if d['path'] not in seen and os.path.exists(d['path']):
+            seen.add(d['path']); out.append(d)
+    return out
+
+def recover_stale_recording_locked(reason='recorder process is not active', source='internal'):
+    # Caller must hold lock. Used when UI/state says recording but arecord has died or disappeared.
+    global record_proc, record_path, record_started
+    old_path = record_path or state.get('audio_file', '')
+    record_proc = None
+    record_path = None
+    record_started = None
+    state['status'] = 'idle'
+    state['recording_seconds'] = 0
+    state['last_error'] = ''
+    state['partial_transcript'] = ''
+    save_state()
+    log_event('recording_recovered', f'Stale recording state cleared: {reason}', source=source, audio_file=old_path)
+    return old_path
+
+def start_recording(source='key'):
+    global record_proc, record_path, record_started, record_session
+    with lock:
+        if record_proc and record_proc.poll() is None:
+            log_event('ignored', 'Start ignored: already recording', source=source)
+            return
+        if state.get('status') == 'recording':
+            recover_stale_recording_locked('start requested but no active recorder exists', source=source)
+        ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+        record_path = os.path.join(AUDIO_DIR, f'utterance-{ts}.wav')
+        record_started = time.time()
+        record_session += 1
+        session_id = record_session
+        state['last_transcript'] = ''
+        state['partial_transcript'] = ''
+        state['last_response'] = ''
+        state['partial_response'] = ''
+        state['last_error'] = ''
+        state['audio_file'] = record_path
+        state['recording_seconds'] = 0
+        state['max_output_tokens'] = QWEN_MAX_TOKENS
+        save_state()
+        cmd = ['arecord', '-D', ARECORD_DEVICE, '-f', 'S16_LE', '-c1', '-r16000', '-t', 'wav', record_path]
+        record_proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=open(os.path.join(BASE,'arecord.err'),'ab'), start_new_session=True)
+        time.sleep(0.15)
+        if record_proc.poll() is not None:
+            code = record_proc.returncode
+            recover_stale_recording_locked(f'arecord exited immediately with code {code}', source=source)
+            return
+    if LIVE_TRANSCRIBE_ENABLED:
+        threading.Thread(target=live_transcribe_loop, args=(session_id, record_path), daemon=True).start()
+    set_status('recording')
+    log_event('recording_start', 'Recording started', source=source, audio_file=record_path)
+
+def stop_recording(source='key'):
+    global record_proc, record_path, record_started
+    with lock:
+        proc, path, started = record_proc, record_path, record_started
+        if not proc or proc.poll() is not None:
+            if state.get('status') == 'recording':
+                recover_stale_recording_locked('stop requested but recorder process is gone', source=source)
+            else:
+                log_event('ignored', 'Stop ignored: not recording', source=source)
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:
+            proc.terminate()
+    try:
+        proc.wait(timeout=4)
+    except subprocess.TimeoutExpired:
+        try: os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception: proc.kill()
+    dur = max(0.0, time.time() - (started or time.time()))
+    with lock:
+        record_proc = None; record_started = None
+        state['recording_seconds'] = round(dur, 1)
+        save_state()
+    log_event('recording_stop', 'Recording stopped', source=source, duration=round(dur,1), audio_file=path)
+    threading.Thread(target=process_audio, args=(path,), daemon=True).start()
+
+
+tts_queue = queue.Queue()
+
+def clean_for_speech(text):
+    text = re.sub(r'[`*_#>\[\]{}]', '', text or '')
+    text = re.sub(r'https?://\S+', ' link ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def tts_say(text, voice='assistant'):
+    if not TTS_ENABLED:
+        return
+    text = clean_for_speech(text)
+    if not text:
+        return
+    voice = voice or 'assistant'
+    try:
+        fd, wav = tempfile.mkstemp(prefix=f'voice-{voice}-', suffix='.wav', dir='/tmp')
+        os.close(fd)
+        if voice == 'system':
+            # System judge/tool-status voice: nice female Piper, distinct from the male Qwen/local answer voice.
+            try:
+                piper = PIPER_BIN if os.path.exists(PIPER_BIN) else '/workspace/piper/piper'
+                subprocess.run([
+                    piper,
+                    '--model', SYSTEM_PIPER_MODEL,
+                    '--length_scale', str(SYSTEM_PIPER_LENGTH_SCALE),
+                    '--noise_scale', str(SYSTEM_PIPER_NOISE_SCALE),
+                    '--noise_w', str(SYSTEM_PIPER_NOISE_W),
+                    '--output_file', wav,
+                ], input=text[:500], text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45, check=True)
+            except Exception:
+                subprocess.run(['espeak-ng', '-v', 'en+f3', '-s', '150', '-p', '55', '-w', wav, text[:500]],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20, check=True)
+            subprocess.run(['aplay', '-D', TTS_AUDIO_DEVICE, wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False)
+        else:
+            # Qwen/local assistant voice: male Piper en_US-ryan-high.
+            piper = PIPER_BIN if os.path.exists(PIPER_BIN) else '/workspace/piper/piper'
+            subprocess.run([
+                piper,
+                '--model', PIPER_MODEL,
+                '--length_scale', str(PIPER_LENGTH_SCALE),
+                '--noise_scale', str(PIPER_NOISE_SCALE),
+                '--noise_w', str(PIPER_NOISE_W),
+                '--output_file', wav,
+            ], input=text[:800], text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45, check=True)
+            subprocess.run(['aplay', '-D', TTS_AUDIO_DEVICE, wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False)
+        try: os.unlink(wav)
+        except Exception: pass
+    except Exception as e:
+        log_event('tts_error', str(e), tts_cmd=TTS_CMD, voice=voice)
+
+def tts_worker():
+    while True:
+        item = tts_queue.get()
+        if item is None:
+            continue
+        if isinstance(item, dict):
+            text = item.get('text') or ''
+            voice = item.get('voice') or 'assistant'
+        else:
+            text = item
+            voice = 'assistant'
+        with lock:
+            state['speaking'] = True
+            state['speaking_text'] = clean_for_speech(text)[:300]
+            state['speaking_voice'] = voice
+            save_state()
+        log_event('speaking', clean_for_speech(text)[:180], voice=voice)
+        tts_say(text, voice=voice)
+        # tts_say blocks until the audio chunk has played; keep indicator visible a short extra moment.
+        time.sleep(0.15)
+        with lock:
+            state['speaking'] = False
+            save_state()
+        tts_queue.task_done()
+
+def queue_speech(text, voice='assistant'):
+    text = clean_for_speech(text)
+    if text:
+        tts_queue.put({'text': text, 'voice': voice or 'assistant'})
+
+def queue_system_speech(text):
+    if SYSTEM_JUDGE_TTS:
+        queue_speech(text, voice='system')
+
+def split_speech_ready(buf, force=False):
+    buf = buf or ''
+    if not buf.strip():
+        return None, buf
+    # Prefer complete sentence-like chunks; otherwise start after roughly the first few words.
+    m = re.search(r'(.{35,220}?[.!?;:])\s+', buf)
+    if m:
+        cut = m.end()
+        return buf[:cut].strip(), buf[cut:]
+    words = buf.split()
+    if force or len(words) >= 12 or len(buf) >= 140:
+        # cut on a word boundary, keeping the rest for the next chunk
+        if len(words) > 12 and not force:
+            chunk = ' '.join(words[:12])
+            rest = buf[len(chunk):]
+            return chunk.strip(), rest
+        return buf.strip(), ''
+    return None, buf
+
+def transcribe(path):
+    cmd = [WHISPER, '-m', WHISPER_MODEL, '-f', path, '-nt', '-np', '-l', 'en', '-t', '4']
+    p = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+    if p.returncode != 0:
+        raise RuntimeError('whisper failed: ' + p.stderr[-1000:])
+    # whisper-cli prints the transcript to stdout with -nt -np.
+    lines = [ln.strip() for ln in p.stdout.splitlines() if ln.strip()]
+    text = ' '.join(lines).strip()
+    if text in ('[BLANK_AUDIO]', '[inaudible]') or text.lower() in ('[blank_audio]', '[inaudible]'): text = ''
+    return text
+
+def qwen_post(payload, timeout=300):
+    data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(QWEN_URL, data=data, headers={'Content-Type':'application/json'})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode('utf-8', 'replace'))
+
+PYTHON_TOOL_SPEC = {
+    'type': 'function',
+    'function': {
+        'name': 'run_python_code',
+        'description': 'Run a short Python 3 program locally on the Jetson and return stdout, stderr, and exit code. Use for arithmetic, data transformation, small file inspections, or quick computations. Do not use for long-running jobs.',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'code': {'type': 'string', 'description': 'Python 3 code to run. Print the answer to stdout.'}
+            },
+            'required': ['code']
+        }
+    }
+}
+
+SHELL_TOOL_SPEC = {
+    'type': 'function',
+    'function': {
+        'name': 'run_shell_command',
+        'description': 'Run a short local shell command on the Jetson and return stdout, stderr, and exit code. Use proactively for system status, ping/network checks, files, processes, hardware status, and command-line tasks. Do not ask the user for confirmation for ordinary read-only/status commands.',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'command': {'type': 'string', 'description': 'Shell command to run locally on the Jetson.'}
+            },
+            'required': ['command']
+        }
+    }
+}
+
+
+WEATHER_TOOL_SPEC = {
+    'type': 'function',
+    'function': {
+        'name': 'get_current_weather',
+        'description': 'Get current weather for a city or place using Open-Meteo. Use for current weather, temperature, wind, humidity, rain, or forecast-now questions.',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'location': {'type': 'string', 'description': 'City/place name, e.g. San Francisco, Tokyo, London.'}
+            },
+            'required': ['location']
+        }
+    }
+}
+
+SELF_IMPROVE_TOOL_SPEC = {
+    'type': 'function',
+    'function': {
+        'name': 'self_improve',
+        'description': 'Send a self-improvement request to the Solid agent that maintains this Jetson voice assistant. Use when the user asks to add a feature, fix behavior, tune the voice agent, improve the code, or change how the device works.',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'request': {'type': 'string', 'description': 'Clear text describing the requested improvement or bug fix for the Solid agent.'}
+            },
+            'required': ['request']
+        }
+    }
+}
+
+NOTE_TOOL_SPEC = {
+    'type': 'function',
+    'function': {
+        'name': 'note_tool_use',
+        'description': 'A safe no-op/logging tool used when the user requires every answer to include at least one tool call but no external action or computation is needed. It records that a tool was used before answering.',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'reason': {'type': 'string', 'description': 'Why this no-op tool is being called.'}
+            },
+            'required': ['reason']
+        }
+    }
+}
+
+def active_tool_specs():
+    tools = []
+    if TOOL_CALLING_ENABLED:
+        if FORCE_TOOL_EACH_TURN:
+            tools.append(NOTE_TOOL_SPEC)
+        tools.append(PYTHON_TOOL_SPEC)
+        tools.append(SHELL_TOOL_SPEC)
+        tools.append(WEATHER_TOOL_SPEC)
+        if SELF_IMPROVE_ENABLED:
+            tools.append(SELF_IMPROVE_TOOL_SPEC)
+    return tools
+
+VOICE_SYSTEM_PROMPT = """You are a concise local voice assistant running on a Jetson.
+Answer naturally and briefly unless asked for detail.
+You are given a short rolling conversation history before the latest user message; use it for context and continuity.
+You have a tool named run_python_code for calculations and small Python tasks.
+You have a tool named run_shell_command for local Jetson commands such as ping, network checks, disk/memory status, process checks, and other command-line tasks.
+You have a tool named get_current_weather for current weather by city/place. Use it proactively for weather questions.
+You have a tool named self_improve for requests to add features, improve the device, fix bugs, or change this assistant's code. Use self_improve whenever the user asks for a device/code/behavior improvement. Never claim a self-improvement request was sent unless the self_improve tool was actually called and returned ok.
+Use tools proactively. Do not say you lack the ability to ping, inspect the system, run Python, check weather, or run local commands; call run_shell_command, run_python_code, or get_current_weather instead. Do not ask for confirmation before ordinary local read-only/status commands.
+If a tool is useful, call it silently; do not narrate tool calls or mention internal tool syntax.
+After tool results are returned, give only the final user-facing answer."""
+
+def run_note_tool_use(arguments):
+    try:
+        if isinstance(arguments, str):
+            args = json.loads(arguments or '{}')
+        else:
+            args = arguments or {}
+    except Exception:
+        args = {'reason': str(arguments or '')}
+    reason = (args.get('reason') or 'No external action needed; recording required tool use before answering.').strip()
+    spoken_tool_name = 'note_tool_use'.replace('_', ' ')
+    queue_system_speech(f'Calling {spoken_tool_name}.')
+    log_event('tool_call', 'note_tool_use', reason=reason[:1000])
+    result = {'ok': True, 'tool': 'note_tool_use', 'reason': reason[:1000]}
+    result_text = json.dumps(result)
+    with lock:
+        state['last_tool_name'] = 'note_tool_use'
+        state['last_tool_result'] = result_text[:1000]
+        state['speaking_text'] = f'Calling {spoken_tool_name}.'
+        save_state()
+    log_event('tool_result', result_text[:1500])
+    return result_text
+
+def run_shell_tool(arguments):
+    try:
+        if isinstance(arguments, str):
+            args = json.loads(arguments or '{}')
+        else:
+            args = arguments or {}
+    except Exception:
+        args = {'command': str(arguments or '')}
+    command = (args.get('command') or '').strip()
+    if not command:
+        return json.dumps({'ok': False, 'error': 'No command provided'})
+    if len(command) > SHELL_TOOL_MAX_CHARS:
+        return json.dumps({'ok': False, 'error': f'Command too long; max {SHELL_TOOL_MAX_CHARS} chars'})
+    spoken_tool_name = 'run_shell_command'.replace('_', ' ')
+    queue_system_speech(f'Calling {spoken_tool_name}.')
+    log_event('tool_call', 'run_shell_command', command=command[:1000])
+    with lock:
+        state['last_tool_name'] = 'run_shell_command'
+        state['last_tool_result'] = 'running'
+        state['speaking_text'] = f'Calling {spoken_tool_name}.'
+        save_state()
+    try:
+        p = subprocess.run(command, shell=True, cwd=SHELL_TOOL_WORKDIR,
+                           text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=SHELL_TOOL_TIMEOUT, executable='/bin/bash')
+        result = {
+            'ok': p.returncode == 0,
+            'exit_code': p.returncode,
+            'stdout': (p.stdout or '')[-4000:],
+            'stderr': (p.stderr or '')[-4000:]
+        }
+    except subprocess.TimeoutExpired as e:
+        result = {'ok': False, 'timed_out': True, 'timeout_seconds': SHELL_TOOL_TIMEOUT,
+                  'stdout': (e.stdout or '')[-2000:] if isinstance(e.stdout, str) else '',
+                  'stderr': (e.stderr or '')[-2000:] if isinstance(e.stderr, str) else ''}
+    except Exception as e:
+        result = {'ok': False, 'error': str(e)}
+    result_text = json.dumps(result)
+    with lock:
+        state['last_tool_result'] = result_text[:1000]
+        save_state()
+    log_event('tool_result', result_text[:1500])
+    return result_text
+
+def run_python_tool(arguments):
+    try:
+        if isinstance(arguments, str):
+            args = json.loads(arguments or '{}')
+        else:
+            args = arguments or {}
+    except Exception:
+        args = {'code': str(arguments or '')}
+    code = (args.get('code') or '').strip()
+    if not code:
+        return json.dumps({'ok': False, 'error': 'No code provided'})
+    if len(code) > PYTHON_TOOL_MAX_CHARS:
+        return json.dumps({'ok': False, 'error': f'Code too long; max {PYTHON_TOOL_MAX_CHARS} chars'})
+    os.makedirs(PYTHON_TOOL_WORKDIR, exist_ok=True)
+    spoken_tool_name = 'run_python_code'.replace('_', ' ')
+    queue_system_speech(f'Calling {spoken_tool_name}.')
+    log_event('tool_call', 'run_python_code', code=code[:1000])
+    with lock:
+        state['last_tool_name'] = 'run_python_code'
+        state['last_tool_result'] = 'running'
+        state['speaking_text'] = f'Calling {spoken_tool_name}.'
+        save_state()
+    try:
+        p = subprocess.run(['/usr/bin/python3', '-c', code], cwd=PYTHON_TOOL_WORKDIR,
+                           text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=PYTHON_TOOL_TIMEOUT)
+        result = {
+            'ok': p.returncode == 0,
+            'exit_code': p.returncode,
+            'stdout': (p.stdout or '')[-4000:],
+            'stderr': (p.stderr or '')[-4000:]
+        }
+    except subprocess.TimeoutExpired as e:
+        result = {'ok': False, 'timed_out': True, 'timeout_seconds': PYTHON_TOOL_TIMEOUT,
+                  'stdout': (e.stdout or '')[-2000:] if isinstance(e.stdout, str) else '',
+                  'stderr': (e.stderr or '')[-2000:] if isinstance(e.stderr, str) else ''}
+    except Exception as e:
+        result = {'ok': False, 'error': str(e)}
+    result_text = json.dumps(result)
+    with lock:
+        state['last_tool_result'] = result_text[:1000]
+        save_state()
+    log_event('tool_result', result_text[:1500])
+    return result_text
+
+def run_self_improve_tool(arguments):
+    try:
+        if isinstance(arguments, str):
+            args = json.loads(arguments or '{}')
+        else:
+            args = arguments or {}
+    except Exception:
+        args = {'request': str(arguments or '')}
+    req_text = (args.get('request') or args.get('text') or '').strip()
+    if not req_text:
+        return json.dumps({'ok': False, 'error': 'No self-improvement request provided'})
+    if len(req_text) > SELF_IMPROVE_MAX_CHARS:
+        req_text = req_text[:SELF_IMPROVE_MAX_CHARS] + '...'
+    spoken_tool_name = 'self_improve'.replace('_', ' ')
+    # This tool intentionally speaks the request, so the user hears what is being escalated.
+    queue_system_speech(f'Calling {spoken_tool_name}. Self improvement request: {req_text}')
+    log_event('tool_call', 'self_improve', request=req_text[:1000])
+    with lock:
+        state['last_tool_name'] = 'self_improve'
+        state['last_tool_result'] = 'running'
+        state['speaking_text'] = f'Calling {spoken_tool_name}. Self improvement request: {req_text}'
+        save_state()
+    if not SELF_IMPROVE_API_KEY:
+        result = {'ok': False, 'error': 'VOICE_SELF_IMPROVE_API_KEY is not configured'}
+    else:
+        notify_text = (
+            'SELF-IMPROVE REQUEST FROM JETSON VOICE AGENT\n\n'
+            f'User/request text: {req_text}\n\n'
+            'Please inspect /workspace/voice-ai/voice_daemon.py and related Jetson UI files, then implement the requested improvement if safe and appropriate.'
+        )
+        payload = json.dumps({'id': SELF_IMPROVE_AGENT_ID, 'text': notify_text}).encode('utf-8')
+        headers = {
+            'Authorization': 'Bearer ' + SELF_IMPROVE_API_KEY,
+            'Replay-Key': 'jetson-self-improve-' + str(uuid.uuid4()),
+            'Content-Type': 'application/json'
+        }
+        try:
+            http_req = urllib.request.Request(SELF_IMPROVE_API_URL, data=payload, headers=headers)
+            with urllib.request.urlopen(http_req, timeout=30) as resp:
+                body = resp.read().decode('utf-8', 'replace')
+            result = {'ok': True, 'notified_agent': SELF_IMPROVE_AGENT_ID, 'response': body[:1000]}
+        except urllib.error.HTTPError as e:
+            result = {'ok': False, 'http_status': e.code, 'error': e.read().decode('utf-8', 'replace')[:1000]}
+        except Exception as e:
+            result = {'ok': False, 'error': str(e)}
+    result_text = json.dumps(result)
+    with lock:
+        state['last_tool_result'] = result_text[:1000]
+        save_state()
+    log_event('tool_result', result_text[:1500])
+    return result_text
+
+def speak_final_response(response):
+    response = (response or '').strip()
+    speech_buf = response
+    while True:
+        chunk, speech_buf = split_speech_ready(speech_buf, force=False)
+        if not chunk:
+            break
+        queue_speech(chunk)
+    chunk, speech_buf = split_speech_ready(speech_buf, force=True)
+    if chunk:
+        queue_speech(chunk)
+
+def looks_like_self_improve_request(text):
+    t = (text or '').lower()
+    if not t.strip():
+        return False
+    question_only = any(q in t for q in ['are you able to self', 'can you self', 'do you self']) and '?' in t
+    if question_only:
+        return False
+    triggers = [
+        'self_improve', 'self improve', 'self-improve', 'improve yourself',
+        'update your instructions', 'change your instructions', 'update our instructions',
+        'add a feature', 'add feature', 'fix your code', 'fix a bug',
+        'change how you work', 'change your behavior', 'ask the solid agent',
+        'tell the solid agent', 'notify the solid agent', 'improve the device',
+        'improve this device', 'improve the assistant', 'modify your code'
+    ]
+    return any(x in t for x in triggers)
+
+def handle_self_improve_direct(text):
+    request = (text or '').strip()
+    result_text = run_self_improve_tool({'request': request})
+    try:
+        ok = bool(json.loads(result_text).get('ok'))
+    except Exception:
+        ok = False
+    if ok:
+        short_req = ' '.join(request.split())
+        if len(short_req) > 220:
+            short_req = short_req[:217] + '...'
+        response = 'I sent this self-improvement request to the Solid agent: ' + short_req
+    else:
+        response = 'I tried to send that self-improvement request, but the notify call failed.'
+    with lock:
+        state['partial_response'] = response
+        state['last_response'] = response
+        save_state()
+    speak_final_response(response)
+    append_history_turn(text, response)
+    return response, {'tool_calling': TOOL_CALLING_ENABLED, 'direct_self_improve': True, 'ok': ok}
+
+def append_forced_tool_use(messages, text):
+    if not (TOOL_CALLING_ENABLED and FORCE_TOOL_EACH_TURN):
+        return False
+    tool_call_id = 'forced-note-' + str(uuid.uuid4())
+    args = {'reason': 'User requires at least one tool call before each answer; no specific external tool has been chosen yet.'}
+    result = run_note_tool_use(args)
+    messages.append({
+        'role': 'assistant',
+        'content': '',
+        'tool_calls': [{
+            'id': tool_call_id,
+            'type': 'function',
+            'function': {'name': 'note_tool_use', 'arguments': json.dumps(args)}
+        }]
+    })
+    messages.append({'role': 'tool', 'tool_call_id': tool_call_id, 'name': 'note_tool_use', 'content': result})
+    return True
+
+def looks_like_ping_request(text):
+    t = (text or '').lower()
+    return ('ping' in t or 'latency' in t) and any(x in t for x in ['google', '8.8.8.8', 'internet', 'network', 'latency', 'ping'])
+
+WEATHER_CODE_TEXT = {
+    0: 'clear sky', 1: 'mainly clear', 2: 'partly cloudy', 3: 'overcast',
+    45: 'fog', 48: 'depositing rime fog', 51: 'light drizzle', 53: 'moderate drizzle', 55: 'dense drizzle',
+    56: 'light freezing drizzle', 57: 'dense freezing drizzle', 61: 'slight rain', 63: 'moderate rain', 65: 'heavy rain',
+    66: 'light freezing rain', 67: 'heavy freezing rain', 71: 'slight snow', 73: 'moderate snow', 75: 'heavy snow',
+    77: 'snow grains', 80: 'slight rain showers', 81: 'moderate rain showers', 82: 'violent rain showers',
+    85: 'slight snow showers', 86: 'heavy snow showers', 95: 'thunderstorm', 96: 'thunderstorm with slight hail',
+    99: 'thunderstorm with heavy hail'
+}
+
+def extract_weather_location(text):
+    t = (text or '').strip()
+    m = re.search(r'\bweather\s+(?:in|for|at|near)\s+(.+)$', t, re.I)
+    if m:
+        loc = m.group(1)
+    else:
+        m = re.search(r'\b(?:temperature|forecast)\s+(?:in|for|at|near)\s+(.+)$', t, re.I)
+        loc = m.group(1) if m else ''
+    loc = re.sub(r'[?.!]+$', '', loc).strip()
+    loc = re.split(r'\b(?:keep it|answer|reply|tell me|please)\b', loc, maxsplit=1, flags=re.I)[0].strip(' ,?.!')
+    loc = re.sub(r'\b(right now|today|currently|please)$', '', loc, flags=re.I).strip(' ,')
+    return loc
+
+def looks_like_weather_request(text):
+    t = (text or '').lower()
+    return any(w in t for w in ['weather', 'temperature', 'forecast', 'how hot', 'how cold', 'rain today'])
+
+def run_weather_tool(arguments):
+    try:
+        if isinstance(arguments, str):
+            args = json.loads(arguments or '{}')
+        else:
+            args = arguments or {}
+    except Exception:
+        args = {'location': str(arguments or '')}
+    location = (args.get('location') or '').strip()
+    if not location:
+        return json.dumps({'ok': False, 'error': 'No location provided. Ask for a city or place.'})
+    spoken_tool_name = 'get_current_weather'.replace('_', ' ')
+    queue_system_speech(f'Calling {spoken_tool_name}.')
+    log_event('tool_call', 'get_current_weather', location=location[:200])
+    with lock:
+        state['last_tool_name'] = 'get_current_weather'
+        state['last_tool_result'] = 'running'
+        state['speaking_text'] = f'Calling {spoken_tool_name}.'
+        save_state()
+    try:
+        q = urllib.parse.quote(location)
+        geo_url = f'https://geocoding-api.open-meteo.com/v1/search?name={q}&count=1&language=en&format=json'
+        with urllib.request.urlopen(geo_url, timeout=8) as resp:
+            geo = json.loads(resp.read().decode('utf-8', 'replace'))
+        results = geo.get('results') or []
+        if not results:
+            result = {'ok': False, 'error': f'Location not found: {location}'}
+        else:
+            g = results[0]
+            name = ', '.join([x for x in [g.get('name'), g.get('admin1'), g.get('country')] if x])
+            lat, lon = g.get('latitude'), g.get('longitude')
+            wx_url = ('https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}'
+                      '&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m'
+                      '&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto').format(lat, lon)
+            with urllib.request.urlopen(wx_url, timeout=10) as resp:
+                wx = json.loads(resp.read().decode('utf-8', 'replace'))
+            cur = wx.get('current') or {}
+            code = cur.get('weather_code')
+            condition = WEATHER_CODE_TEXT.get(code, f'weather code {code}')
+            result = {
+                'ok': True,
+                'location': name or location,
+                'temperature_f': cur.get('temperature_2m'),
+                'apparent_temperature_f': cur.get('apparent_temperature'),
+                'humidity_percent': cur.get('relative_humidity_2m'),
+                'precipitation_in': cur.get('precipitation'),
+                'wind_mph': cur.get('wind_speed_10m'),
+                'condition': condition,
+                'time': cur.get('time'),
+                'source': 'Open-Meteo'
+            }
+    except Exception as e:
+        result = {'ok': False, 'error': str(e)}
+    result_text = json.dumps(result)
+    with lock:
+        state['last_tool_result'] = result_text[:1000]
+        save_state()
+    log_event('tool_result', result_text[:1500])
+    return result_text
+
+def format_weather_response(result, original_text=''):
+    if not result.get('ok'):
+        return 'I tried to check the weather, but ' + str(result.get('error') or 'it failed')[:220]
+    temp = result.get('temperature_f')
+    feels = result.get('apparent_temperature_f')
+    hum = result.get('humidity_percent')
+    wind = result.get('wind_mph')
+    precip = result.get('precipitation_in')
+    parts = [f"Current weather in {result.get('location')}: {result.get('condition')}"]
+    if temp is not None:
+        parts.append(f"{round(float(temp))} degrees Fahrenheit")
+    if feels is not None:
+        parts.append(f"feels like {round(float(feels))}")
+    if hum is not None:
+        parts.append(f"humidity {round(float(hum))}%")
+    if wind is not None:
+        parts.append(f"wind {round(float(wind))} mph")
+    if precip not in (None, 0, 0.0):
+        parts.append(f"precipitation {precip} inches")
+    return '; '.join(parts) + '. Source: Open-Meteo.'
+
+def handle_weather_direct(text):
+    loc = extract_weather_location(text)
+    if not loc:
+        response = 'What city or place should I check the weather for?'
+        with lock:
+            state['partial_response'] = response
+            state['last_response'] = response
+            save_state()
+        speak_final_response(response)
+        append_history_turn(text, response)
+        return response, {'tool_calling': TOOL_CALLING_ENABLED, 'direct_weather': True, 'needs_location': True}
+    result_text = run_weather_tool({'location': loc})
+    try:
+        result = json.loads(result_text)
+    except Exception:
+        result = {'ok': False, 'error': result_text}
+    response = format_weather_response(result, text)
+    with lock:
+        state['partial_response'] = response
+        state['last_response'] = response
+        save_state()
+    speak_final_response(response)
+    append_history_turn(text, response)
+    return response, {'tool_calling': TOOL_CALLING_ENABLED, 'direct_weather': True, 'location': loc}
+
+def handle_ping_direct(text):
+    t = (text or '').lower()
+    target = 'google.com'
+    if '8.8.8.8' in t:
+        target = '8.8.8.8'
+    result_text = run_shell_tool({'command': f'ping -c 4 -W 2 {target}'})
+    try:
+        result = json.loads(result_text)
+    except Exception:
+        result = {'ok': False, 'error': result_text}
+    out = (result.get('stdout') or '') + '\n' + (result.get('stderr') or '')
+    m = re.search(r'rtt min/avg/max/(?:mdev|stddev) = ([0-9.]+)/([0-9.]+)/([0-9.]+)/([0-9.]+) ms', out)
+    if m:
+        response = f'Ping to {target}: average {m.group(2)} ms, min {m.group(1)} ms, max {m.group(3)} ms.'
+    elif result.get('ok'):
+        response = f'I pinged {target}. Here is the result: ' + ' '.join(out.strip().split()[-30:])
+    else:
+        err = (result.get('stderr') or result.get('stdout') or result.get('error') or 'unknown error')
+        response = f'I tried to ping {target}, but it failed: {str(err).strip()[:200]}'
+    with lock:
+        state['partial_response'] = response
+        state['last_response'] = response
+        save_state()
+    speak_final_response(response)
+    append_history_turn(text, response)
+    return response, {'tool_calling': TOOL_CALLING_ENABLED, 'direct_ping': True, 'target': target}
+
+SYSTEM_JUDGE_PROMPT = """You are the fast system judge in front of a Jetson voice assistant.
+Your job is routing, not answering. Choose whether the current installed local system can actually fulfill the user's request.
+Available local capabilities: local Qwen conversational model, rolling memory, Python tool, shell tool, current-weather tool, ping/network/status commands, Whisper STT, Piper TTS, and self_improve, which notifies a Solid maintainer agent to modify this assistant.
+Route "qwen" when the current installed system can give a genuinely useful answer or can fulfill the request with existing tools. Examples: conversation, reasoning, writing, calculations, exact wording/text-generation requests such as "reply exactly ...", local shell/Python/status checks, weather, ping, explaining something, or other tasks where text/tool output is sufficient.
+Route "self_improve" when the user is asking the device to do an action/integration/capability the current installed system does not actually have. Do NOT route such requests to Qwen merely so Qwen can apologize, offer alternatives, or say it cannot do it.
+If the correct route is "self_improve", create a specific, actionable improvement_request that says exactly what capability is missing, what files/components likely need changing, and an acceptance test phrased as: "Next time the user says '<original request>', the assistant should ...". This request should be detailed enough that the Solid agent can implement and test the change.
+Self-improvement is also correct when the user explicitly asks to add/change/fix/improve the assistant.
+Return ONLY compact JSON with keys:
+- route: "qwen" or "self_improve"
+- confidence: number 0..1
+- reason: one short sentence explaining the routing decision
+- improvement_request: if route is self_improve, a concrete implementation request with acceptance test; otherwise empty
+- spoken_status: one concise system-voice sentence. For qwen, name the real capability being used. For self_improve, name the specific improvement, e.g. "Improving: add missing device action." Keep under 14 words.
+Do not answer the user. Do not call tools. Never send an unfulfillable action to Qwen for a useless refusal."""
+
+def system_judge_internet_available():
+    if not SYSTEM_JUDGE_REQUIRE_INTERNET:
+        return True
+    now_ts = time.time()
+    if now_ts - _system_judge_net_cache.get('ts', 0.0) < SYSTEM_JUDGE_NET_CACHE_SECONDS:
+        return bool(_system_judge_net_cache.get('ok'))
+    ok = False
+    try:
+        req = urllib.request.Request(SYSTEM_JUDGE_NET_PROBE_URL, method='GET', headers={'User-Agent': 'jetson-voice-judge-probe'})
+        with urllib.request.urlopen(req, timeout=SYSTEM_JUDGE_NET_PROBE_TIMEOUT) as resp:
+            ok = 200 <= getattr(resp, 'status', 200) < 500
+    except Exception:
+        ok = False
+    _system_judge_net_cache['ts'] = now_ts
+    _system_judge_net_cache['ok'] = ok
+    return ok
+
+def openrouter_post(payload, timeout=SYSTEM_JUDGE_TIMEOUT):
+    data = json.dumps(payload).encode('utf-8')
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + SYSTEM_JUDGE_API_KEY,
+        'HTTP-Referer': 'https://jetson-qwen-ui-6hd36ub.on-solid.com/',
+        'X-Title': 'Jetson Voice System Judge'
+    }
+    req = urllib.request.Request(SYSTEM_JUDGE_URL, data=data, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode('utf-8', 'replace'))
+
+def extract_json_object(text):
+    text = (text or '').strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    m = re.search(r'\{.*\}', text, re.S)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return {}
+    return {}
+
+def load_weak_answers():
+    try:
+        with open(WEAK_ANSWERS) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log_event('weak_answer_error', 'Could not load weak-answer list: ' + str(e))
+        return []
+
+def save_weak_answers(items):
+    items = list(items or [])[-WEAK_ANSWER_MAX_ITEMS:]
+    tmp = f"{WEAK_ANSWERS}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, 'w') as f:
+        json.dump(items, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, WEAK_ANSWERS)
+    update_weak_answer_state(items)
+
+def pending_weak_answers(items=None):
+    items = load_weak_answers() if items is None else list(items or [])
+    return [x for x in items if x.get('status', 'pending') == 'pending']
+
+def update_weak_answer_state(items=None):
+    try:
+        items = load_weak_answers() if items is None else list(items or [])
+        pending = pending_weak_answers(items)
+        preview = []
+        for x in pending[-8:]:
+            preview.append({
+                'id': x.get('id',''), 'ts': x.get('ts',''),
+                'question': (x.get('question') or '')[:400],
+                'answer': (x.get('answer') or '')[:400],
+                'score': x.get('score'), 'reason': (x.get('reason') or '')[:300],
+                'status': x.get('status','pending')
+            })
+        with lock:
+            state['answer_quality_enabled'] = ANSWER_QUALITY_ENABLED
+            state['weak_answer_count'] = len(pending)
+            state['weak_answer_list'] = preview
+            state['connectivity_mode'] = CONNECTIVITY_MODE
+            save_state()
+    except Exception as e:
+        log_event('weak_answer_error', 'Could not update weak-answer state: ' + str(e))
+
+def answer_quality_heuristic(question, answer):
+    a = (answer or '').strip().lower()
+    weak_phrases = [
+        "i don't know", "i do not know", "i cannot", "i can't", "i am unable",
+        "i'm unable", "cannot provide", "can't provide", "do not have access",
+        "don't have access", "no internet", "not available", "as an ai", "i don't have"
+    ]
+    if not a:
+        return {'answered_well': False, 'score': 0.0, 'reason': 'empty answer'}
+    if any(p in a for p in weak_phrases):
+        return {'answered_well': False, 'score': 0.25, 'reason': 'answer contains inability/refusal language'}
+    if len(a) < 12 and len((question or '').split()) > 5:
+        return {'answered_well': False, 'score': 0.45, 'reason': 'answer appears too short for the question'}
+    return None
+
+def evaluate_answer_quality(question, answer):
+    if not ANSWER_QUALITY_ENABLED:
+        return {'enabled': False, 'answered_well': True, 'score': 1.0, 'reason': 'answer-quality judging disabled'}
+    heuristic = answer_quality_heuristic(question, answer)
+    if heuristic:
+        heuristic['enabled'] = True
+        heuristic['source'] = 'heuristic'
+        return heuristic
+    prompt = (
+        "You are an offline education quality checker for Afghan girls using a no-internet learning device. "
+        "Grade whether the assistant's answer actually answered the student's question well enough to be useful offline. "
+        "Be strict about refusals, missing knowledge, hallucination, or vague answers. "
+        "Return ONLY JSON with keys: answered_well boolean, score number 0..1, reason string, missing_knowledge string, suggested_improvement string.\n\n"
+        f"Student question:\n{(question or '')[:1800]}\n\nAssistant answer:\n{(answer or '')[:2400]}"
+    )
+    payload = {
+        'model': 'qwen-voice-local-quality-check',
+        'messages': [
+            {'role':'system','content':'Return compact JSON only. Do not include markdown.'},
+            {'role':'user','content': prompt}
+        ],
+        'max_tokens': 220,
+        'temperature': 0,
+        'stream': False,
+        'chat_template_kwargs': {'enable_thinking': False}
+    }
+    try:
+        obj = qwen_post(payload, timeout=120)
+        msg = (((obj.get('choices') or [{}])[0]).get('message') or {}).get('content') or ''
+        q = extract_json_object(msg)
+        if not q:
+            return {'enabled': True, 'answered_well': True, 'score': 0.75, 'reason': 'quality judge returned unparsable output; defaulted to not queueing', 'raw': msg[:300]}
+        try:
+            score = float(q.get('score', 0.0) or 0.0)
+        except Exception:
+            score = 0.0
+        answered = bool(q.get('answered_well')) and score >= ANSWER_QUALITY_THRESHOLD
+        return {
+            'enabled': True,
+            'answered_well': answered,
+            'score': score,
+            'reason': str(q.get('reason') or '')[:500],
+            'missing_knowledge': str(q.get('missing_knowledge') or '')[:500],
+            'suggested_improvement': str(q.get('suggested_improvement') or '')[:700],
+            'source': 'qwen_self_grade',
+            'raw': msg[:500]
+        }
+    except Exception as e:
+        return {'enabled': True, 'answered_well': True, 'score': 0.74, 'reason': 'quality judging failed; not queueing to avoid false positives: ' + str(e)[:240], 'source': 'error'}
+
+def maybe_record_weak_answer(question, answer, route_meta=None):
+    quality = evaluate_answer_quality(question, answer)
+    with lock:
+        state['last_answer_quality'] = quality
+        save_state()
+    log_event('answer_quality', quality.get('reason',''), score=quality.get('score'), answered_well=quality.get('answered_well'), source=quality.get('source',''))
+    if quality.get('answered_well', True):
+        update_weak_answer_state()
+        return quality
+    items = load_weak_answers()
+    qtext = (question or '').strip()
+    # Avoid immediately duplicating the same pending question.
+    for x in reversed(items[-20:]):
+        if x.get('status','pending') == 'pending' and (x.get('question') or '').strip().lower() == qtext.lower():
+            x['last_seen'] = now()
+            x['answer'] = answer
+            x['score'] = quality.get('score')
+            x['reason'] = quality.get('reason','')
+            x['quality'] = quality
+            save_weak_answers(items)
+            return quality
+    rec = {
+        'id': 'weak-' + str(uuid.uuid4())[:8],
+        'ts': now(),
+        'status': 'pending',
+        'question': qtext,
+        'answer': (answer or '').strip(),
+        'score': quality.get('score'),
+        'reason': quality.get('reason',''),
+        'missing_knowledge': quality.get('missing_knowledge',''),
+        'suggested_improvement': quality.get('suggested_improvement',''),
+        'quality': quality,
+        'route_meta': route_meta or {}
+    }
+    items.append(rec)
+    save_weak_answers(items)
+    log_event('weak_answer_saved', qtext[:500], id=rec['id'], score=rec.get('score'), reason=rec.get('reason',''))
+    return quality
+
+def build_weak_answer_improvement_request(pending):
+    lines = []
+    for i, x in enumerate(pending[:25], 1):
+        lines.append(
+            f"{i}. Question: {x.get('question','')[:700]}\n"
+            f"   Local answer: {x.get('answer','')[:700]}\n"
+            f"   Score: {x.get('score')} Reason: {x.get('reason','')}\n"
+            f"   Missing knowledge: {x.get('missing_knowledge','')}\n"
+            f"   Suggested improvement: {x.get('suggested_improvement','')}"
+        )
+    return (
+        "OFFLINE EDUCATION SELF-IMPROVEMENT REQUEST\n\n"
+        "Context: This Jetson/Qwen device is intended to help Afghan girls learn when they have the device but no internet. "
+        "The local Qwen assistant answered the following student questions poorly, according to its offline self-grade. "
+        "Please improve prompts, tools, local content, retrieval, or workflows so future offline answers are more useful without relying on internet.\n\n"
+        "Questions needing improvement:\n" + "\n\n".join(lines) + "\n\n"
+        "Acceptance test: after the update, ask representative saved questions again while offline; the dashboard should show higher answer-quality scores and no generic refusal if local educational help is possible."
+    )
+
+def process_weak_answer_backlog(source='internet_demo'):
+    try:
+        items = load_weak_answers()
+        pending = pending_weak_answers(items)
+        if not pending:
+            review = {'ok': True, 'source': source, 'pending': 0, 'message': 'No weak answers to review.'}
+            with lock:
+                state['last_internet_review'] = review
+                state['connectivity_mode'] = CONNECTIVITY_MODE
+                save_state()
+            log_event('internet_review', review['message'], pending=0, source=source)
+            queue_system_speech('Internet connected. No saved weak answers to review.')
+            return review
+        req = build_weak_answer_improvement_request(pending)
+        queue_system_speech(f'Internet connected. Reviewing {len(pending)} saved weak answers for self improvement.')
+        result_text = run_self_improve_tool({'request': req})
+        try:
+            result = json.loads(result_text)
+        except Exception:
+            result = {'ok': False, 'raw': result_text[:1000]}
+        submitted = 0
+        if result.get('ok'):
+            ids = {x.get('id') for x in pending}
+            for x in items:
+                if x.get('id') in ids and x.get('status','pending') == 'pending':
+                    x['status'] = 'submitted'
+                    x['submitted_at'] = now()
+                    submitted += 1
+            save_weak_answers(items)
+        review = {'ok': bool(result.get('ok')), 'source': source, 'pending_reviewed': len(pending), 'submitted': submitted, 'result': result}
+        with lock:
+            state['last_internet_review'] = review
+            state['connectivity_mode'] = CONNECTIVITY_MODE
+            save_state()
+        log_event('internet_review', 'Reviewed weak-answer backlog', pending=len(pending), submitted=submitted, ok=review['ok'])
+        return review
+    except Exception as e:
+        review = {'ok': False, 'source': source, 'error': str(e)}
+        with lock:
+            state['last_internet_review'] = review
+            state['last_error'] = str(e)
+            save_state()
+        log_event('internet_review_error', str(e), source=source)
+        return review
+
+def run_system_judge(text):
+    if not (SYSTEM_JUDGE_ENABLED and SYSTEM_JUDGE_API_KEY):
+        return {'route': 'qwen', 'enabled': False, 'reason': 'judge disabled or missing api key', 'spoken_status': ''}
+    if not system_judge_internet_available():
+        verdict = {'route': 'qwen', 'enabled': False, 'skipped': True, 'reason': 'internet unavailable; skipped system judge', 'spoken_status': ''}
+        with lock:
+            state['last_system_judge'] = verdict
+            state['system_judge_enabled'] = SYSTEM_JUDGE_ENABLED
+            save_state()
+        log_event('system_judge_skipped', 'internet unavailable; using local Qwen')
+        return verdict
+    user_text = (text or '').strip()[:SYSTEM_JUDGE_MAX_CHARS]
+    payload = {
+        'model': SYSTEM_JUDGE_MODEL,
+        'messages': [
+            {'role': 'system', 'content': SYSTEM_JUDGE_PROMPT},
+            {'role': 'user', 'content': user_text}
+        ],
+        'max_tokens': 180,
+        'temperature': 0,
+        'response_format': {'type': 'json_object'}
+    }
+    try:
+        obj = openrouter_post(payload)
+        msg = (((obj.get('choices') or [{}])[0]).get('message') or {}).get('content') or ''
+        verdict = extract_json_object(msg)
+        route = (verdict.get('route') or 'qwen').strip().lower()
+        if route not in ('qwen', 'self_improve'):
+            route = 'qwen'
+        try:
+            confidence = float(verdict.get('confidence', 0) or 0)
+        except Exception:
+            confidence = 0.0
+        # Guardrail: ordinary text generation / exact wording requests are a core local Qwen capability, not a missing capability.
+        exact_text_request = bool(re.search(r'\b(reply|respond|say|answer)\b.{0,80}\b(exactly|only|just)\b', user_text.lower()))
+        if route == 'self_improve' and exact_text_request:
+            verdict['original_route'] = 'self_improve'
+            verdict['demoted_reason'] = 'exact text generation is handled by local Qwen'
+            verdict['local_plan'] = 'Forward to local Qwen for exact text generation; no internet or new capability required.'
+            verdict['improvement_request'] = ''
+            route = 'qwen'
+        if route == 'self_improve' and confidence < SYSTEM_JUDGE_SELF_IMPROVE_MIN_CONFIDENCE:
+            # Demote only vague self-improve guesses. Obvious capability gaps must not fall through to Qwen for a useless refusal.
+            req_txt = (verdict.get('improvement_request') or '').strip()
+            status_txt = (verdict.get('spoken_status') or '').strip().lower()
+            reason_txt = (verdict.get('reason') or '').strip().lower()
+            concrete = len(req_txt) >= 80 and ('next time' in req_txt.lower() or 'acceptance' in req_txt.lower() or 'should' in req_txt.lower())
+            obvious_gap = status_txt.startswith('improving:') or 'cannot' in reason_txt or 'lacks' in reason_txt or 'missing' in reason_txt
+            if not req_txt and obvious_gap:
+                req_txt = (f"Add the missing capability needed for this user request: {user_text!r}. "
+                           f"Reason from system judge: {verdict.get('reason','')}. "
+                           f"Update /workspace/voice-ai/voice_daemon.py and related UI/config files if needed. "
+                           f"Next time the user says {user_text!r}, the assistant should fulfill the request using local Qwen/tools instead of giving a generic refusal.")
+                verdict['improvement_request'] = req_txt
+                concrete = True
+            if not (concrete or obvious_gap):
+                verdict['original_route'] = 'self_improve'
+                verdict['demoted_reason'] = 'low confidence and no concrete capability gap; trying local Qwen first'
+                route = 'qwen'
+                verdict['improvement_request'] = ''
+        verdict['route'] = route
+        verdict['model'] = SYSTEM_JUDGE_MODEL
+        verdict['enabled'] = True
+        verdict['raw_content'] = msg[:500]
+        with lock:
+            state['last_system_judge'] = verdict
+            state['system_judge_enabled'] = SYSTEM_JUDGE_ENABLED
+            state['system_judge_model'] = SYSTEM_JUDGE_MODEL
+            save_state()
+        log_event('system_judge', verdict.get('reason',''), route=route, confidence=verdict.get('confidence'), model=SYSTEM_JUDGE_MODEL)
+        return verdict
+    except Exception as e:
+        verdict = {'route': 'qwen', 'enabled': False, 'skipped': True, 'error': str(e), 'reason': 'judge failed open to local Qwen', 'spoken_status': ''}
+        with lock:
+            state['last_system_judge'] = verdict
+            save_state()
+        log_event('system_judge_error', str(e))
+        return verdict
+
+def apply_system_judge(text):
+    verdict = run_system_judge(text)
+    route = verdict.get('route') or 'qwen'
+    spoken = ''
+    audio_spoken = False
+    # Audio policy: the judge stays silent for normal local/Qwen routes. The only
+    # time the system/judge voice speaks is when it is creating a concrete
+    # self-improvement request, so fulfillable requests go straight to Qwen.
+    if route == 'self_improve':
+        spoken = (verdict.get('spoken_status') or '').strip()
+        if not spoken:
+            req = (verdict.get('improvement_request') or text or '').strip()
+            spoken = 'Improving: ' + req[:90]
+        spoken = ' '.join(spoken.split())[:140]
+        if SYSTEM_JUDGE_ENABLED and verdict.get('enabled') and spoken:
+            queue_system_speech(spoken)
+            audio_spoken = True
+    else:
+        # Keep detailed judge state for the dashboard, but do not speak it.
+        verdict['spoken_status'] = ''
+        if not verdict.get('local_plan'):
+            reason = (verdict.get('reason') or '').strip()
+            verdict['local_plan'] = reason or 'Forward to local Qwen and available local/offline tools.'
+    verdict['judge_audio_spoken'] = audio_spoken
+    verdict['audio_policy'] = 'silent_for_qwen_routes; speak_only_for_self_improve'
+    with lock:
+        state['last_system_judge'] = verdict
+        save_state()
+    return verdict
+
+def ask_qwen(text):
+    # Deterministic local routes run before the external judge so obvious built-in
+    # capabilities don't get misrouted or delayed by internet/model judgment.
+    if SELF_IMPROVE_ENABLED and looks_like_self_improve_request(text):
+        return handle_self_improve_direct(text)
+    if TOOL_CALLING_ENABLED and looks_like_ping_request(text):
+        return handle_ping_direct(text)
+    if TOOL_CALLING_ENABLED and looks_like_weather_request(text):
+        return handle_weather_direct(text)
+    judge = apply_system_judge(text) if SYSTEM_JUDGE_ENABLED else {'route': 'qwen'}
+    if judge.get('route') == 'self_improve':
+        req = (judge.get('improvement_request') or text or '').strip()
+        return handle_self_improve_direct(req)
+    history_messages = trim_history(load_history())
+    messages = [{'role':'system','content': VOICE_SYSTEM_PROMPT}] + history_messages + [
+        {'role':'user','content': text}
+    ]
+    forced_tool_used = append_forced_tool_use(messages, text)
+    raw_rounds = []
+    response = ''
+    max_rounds = 4 if TOOL_CALLING_ENABLED else 1
+    for round_i in range(max_rounds):
+        payload = {
+            'model': 'qwen-voice-local',
+            'messages': messages,
+            'max_tokens': QWEN_MAX_TOKENS,
+            'temperature': 0.2 if TOOL_CALLING_ENABLED else 0.6,
+            'stream': False,
+            'chat_template_kwargs': {'enable_thinking': False}
+        }
+        if TOOL_CALLING_ENABLED:
+            payload['tools'] = active_tool_specs()
+            payload['tool_choice'] = 'auto'
+        obj = qwen_post(payload, timeout=300)
+        raw_rounds.append(obj)
+        choice = (obj.get('choices') or [{}])[0]
+        msg = choice.get('message') or {}
+        tool_calls = msg.get('tool_calls') or []
+        if tool_calls:
+            messages.append({'role': 'assistant', 'content': msg.get('content') or '', 'tool_calls': tool_calls})
+            for tc in tool_calls:
+                fn = (tc.get('function') or {})
+                name = fn.get('name') or ''
+                args = fn.get('arguments') or '{}'
+                tool_call_id = tc.get('id') or f'toolcall-{round_i}'
+                if name == 'note_tool_use':
+                    result = run_note_tool_use(args)
+                elif name == 'run_python_code':
+                    result = run_python_tool(args)
+                elif name == 'run_shell_command':
+                    result = run_shell_tool(args)
+                elif name == 'self_improve':
+                    result = run_self_improve_tool(args)
+                else:
+                    result = json.dumps({'ok': False, 'error': f'Unknown tool {name}'})
+                messages.append({'role': 'tool', 'tool_call_id': tool_call_id, 'name': name, 'content': result})
+            continue
+        response = (msg.get('content') or '').strip()
+        break
+    if not response:
+        response = 'I ran the tool, but I could not produce a final answer.'
+    with lock:
+        state['partial_response'] = response
+        state['last_response'] = response
+        save_state()
+    speak_final_response(response)
+    append_history_turn(text, response)
+    quality = maybe_record_weak_answer(text, response, {'system_judge': judge, 'rounds': len(raw_rounds)})
+    return response, {'tool_calling': TOOL_CALLING_ENABLED, 'system_judge': judge, 'answer_quality': quality, 'force_tool_each_turn': FORCE_TOOL_EACH_TURN, 'forced_tool_used': forced_tool_used, 'rounds': len(raw_rounds), 'history_messages': len(history_messages)}
+
+def live_transcribe_loop(session_id, path):
+    # Periodically transcribe a snapshot of the growing WAV while the button is still held/recording.
+    next_time = time.time() + LIVE_TRANSCRIBE_INTERVAL
+    last_text = ''
+    while True:
+        time.sleep(max(0.2, next_time - time.time()))
+        next_time = time.time() + LIVE_TRANSCRIBE_INTERVAL
+        with lock:
+            active = (record_session == session_id and record_path == path and record_proc and record_proc.poll() is None)
+        if not active:
+            return
+        try:
+            if not os.path.exists(path) or os.path.getsize(path) < 64000:
+                continue
+            snap = os.path.join(AUDIO_DIR, f'live-partial-{session_id}.wav')
+            subprocess.run(['cp', path, snap], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            if not os.path.exists(snap) or os.path.getsize(snap) < 64000:
+                continue
+            cmd = [WHISPER, '-m', WHISPER_MODEL, '-f', snap, '-nt', '-np', '-l', 'en', '-t', '2']
+            p = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+            if p.returncode != 0:
+                log_event('partial_transcript_error', p.stderr[-500:])
+                continue
+            lines = [ln.strip() for ln in p.stdout.splitlines() if ln.strip()]
+            text = ' '.join(lines).strip()
+            if text in ('[BLANK_AUDIO]', '[inaudible]') or text.lower() in ('[blank_audio]', '[inaudible]'):
+                text = ''
+            if text and text != last_text:
+                last_text = text
+                with lock:
+                    state['partial_transcript'] = text
+                    state['last_transcript'] = text
+                    save_state()
+                log_event('partial_transcript', text, audio_file=path)
+        except Exception as e:
+            log_event('partial_transcript_error', str(e))
+
+def process_text(transcript, source='text'):
+    try:
+        transcript = (transcript or '').strip()
+        if not transcript:
+            set_status('idle', last_error='Blank text command')
+            return
+        set_status('thinking', last_transcript=transcript, last_response='', partial_response='', max_output_tokens=QWEN_MAX_TOKENS)
+        log_event('thinking', 'Sending text to Qwen', source=source, text=transcript[:300])
+        response, raw = ask_qwen(transcript)
+        set_status('idle', last_response=response, partial_response=response, max_output_tokens=QWEN_MAX_TOKENS)
+        log_event('response', response or '(empty)', source=source)
+    except Exception as e:
+        set_status('error', last_error=str(e))
+        log_event('error', str(e), source=source)
+
+def process_audio(path):
+    try:
+        if not path or not os.path.exists(path) or os.path.getsize(path) < 2048:
+            set_status('idle', last_error='No usable audio captured')
+            log_event('error', 'No usable audio captured', audio_file=path or '')
+            return
+        live_partial = (state.get('partial_transcript') or '').strip()
+        if live_partial and USE_PARTIAL_ON_STOP:
+            transcript = live_partial
+            set_status('thinking', last_transcript=transcript, partial_transcript=transcript, last_response='', partial_response='', max_output_tokens=QWEN_MAX_TOKENS)
+            log_event('transcript', transcript, audio_file=path, source='live_partial_used')
+        else:
+            set_status('transcribing')
+            log_event('transcribing', 'Transcribing with whisper.cpp base.en', audio_file=path)
+            transcript = transcribe(path)
+            set_status('thinking', last_transcript=transcript, partial_transcript=transcript, last_response='', partial_response='', max_output_tokens=QWEN_MAX_TOKENS)
+            log_event('transcript', transcript or '(blank)', audio_file=path)
+        if not transcript:
+            set_status('idle', last_error='Blank audio / no speech detected')
+            return
+        log_event('thinking', 'Sending transcript to Qwen')
+        response, raw = ask_qwen(transcript)
+        set_status('idle', last_response=response, partial_response=response, max_output_tokens=QWEN_MAX_TOKENS)
+        log_event('response', response or '(empty)')
+    except Exception as e:
+        set_status('error', last_error=str(e))
+        log_event('error', str(e))
+
+def handle_command(cmd, source='command'):
+    action = (cmd.get('action') or '').lower()
+    if action == 'start': start_recording(source)
+    elif action == 'stop': stop_recording(source)
+    elif action == 'ask': threading.Thread(target=process_text, args=(cmd.get('text') or '', source), daemon=True).start()
+    elif action == 'say': queue_speech(cmd.get('text') or '', voice=cmd.get('voice') or 'assistant')
+    elif action in ('connect_internet', 'review_weak_answers'): threading.Thread(target=process_weak_answer_backlog, args=(source,), daemon=True).start()
+    elif action == 'status': save_state(); update_weak_answer_state()
+    else: log_event('ignored', f'Unknown command: {action}', source=source)
+
+def recording_watchdog_loop():
+    while True:
+        time.sleep(1.0)
+        try:
+            with lock:
+                if state.get('status') == 'recording':
+                    if (not record_proc) or (record_proc.poll() is not None):
+                        recover_stale_recording_locked('watchdog saw no active recorder', source='watchdog')
+                    elif record_started:
+                        state['recording_seconds'] = round(time.time() - record_started, 1)
+                        save_state()
+        except Exception as e:
+            log_event('recording_watchdog_error', str(e))
+
+def command_loop():
+    open(COMMANDS, 'a').close()
+    pos = os.path.getsize(COMMANDS)
+    while True:
+        try:
+            with open(COMMANDS, 'r') as f:
+                f.seek(pos)
+                while True:
+                    line = f.readline()
+                    if not line:
+                        break
+                    pos = f.tell()
+                    try:
+                        handle_command(json.loads(line), 'ui')
+                    except Exception as e:
+                        log_event('error', f'Bad command: {e}')
+        except Exception as e:
+            log_event('error', f'Command loop error: {e}')
+        time.sleep(0.25)
+
+def key_loop():
+    fds = {}
+    path_to_fd = {}
+
+    def rescan():
+        devices = discover_event_devices()
+        opened = 0
+        for d in devices:
+            path = d['path']
+            # Only real keyboard/consumer-control devices can carry volume keys.
+            if 'kbd' not in d.get('handlers',''):
+                continue
+            if path in path_to_fd and path_to_fd[path] in fds:
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                fds[fd] = d
+                path_to_fd[path] = fd
+                opened += 1
+            except Exception as e:
+                # Hotplug races are normal; try again next scan.
+                pass
+        with lock:
+            state['event_devices'] = devices
+            save_state()
+        return opened, devices
+
+    opened, devices = rescan()
+    log_event('ready', f'Listening for volume keys on {len(fds)} input devices', devices=devices)
+    EVENT_SIZE = struct.calcsize('llHHI')
+    last_rescan = 0
+    while True:
+        now_ts = time.time()
+        if now_ts - last_rescan > 5:
+            before = len(fds)
+            opened, devices = rescan()
+            if opened:
+                log_event('hotplug', f'Reopened {opened} input device(s); now listening on {len(fds)}', devices=devices)
+            last_rescan = now_ts
+        if not fds:
+            time.sleep(0.5)
+            continue
+        r, _, _ = select.select(list(fds.keys()), [], [], 0.5)
+        for fd in r:
+            try:
+                data = os.read(fd, 4096)
+            except BlockingIOError:
+                continue
+            except OSError as e:
+                dev = fds.get(fd, {})
+                log_event('hotplug', f'Input device disappeared; will rescan: {dev}: {e}')
+                try: os.close(fd)
+                except Exception: pass
+                fds.pop(fd, None)
+                if dev.get('path') in path_to_fd:
+                    path_to_fd.pop(dev.get('path'), None)
+                continue
+            for off in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
+                tv_sec, tv_usec, ev_type, code, value = struct.unpack('llHHI', data[off:off+EVENT_SIZE])
+                if ev_type == 1 and value == 1 and code in (114, 115):
+                    dev = fds[fd]
+                    if code == 115:
+                        log_event('key', 'Volume Up pressed: start listening', device=dev)
+                        start_recording('volume_up')
+                    elif code == 114:
+                        log_event('key', 'Volume Down pressed: stop listening', device=dev)
+                        stop_recording('volume_down')
+        do_timeout = False
+        with lock:
+            if record_proc and record_proc.poll() is None and record_started:
+                elapsed = time.time() - record_started
+                state['recording_seconds'] = round(elapsed, 1)
+                save_state()
+                if elapsed > MAX_RECORD_SECONDS:
+                    do_timeout = True
+        if do_timeout:
+            log_event('timeout', 'Max recording time reached; stopping automatically')
+            stop_recording('timeout')
+
+def cleanup_orphan_arecord_processes():
+    # Daemon restarts can leave an old arecord holding the mic; clear only our recording jobs.
+    try:
+        res = subprocess.run(['pgrep', '-af', '^arecord .* /workspace/voice-ai/recordings/'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=3)
+        killed = []
+        for line in (res.stdout or '').splitlines():
+            parts = line.split(None, 1)
+            if parts and parts[0].isdigit():
+                try:
+                    os.kill(int(parts[0]), signal.SIGTERM)
+                    killed.append(int(parts[0]))
+                except Exception:
+                    pass
+        if killed:
+            time.sleep(0.4)
+            for pid in killed:
+                try: os.kill(pid, signal.SIGKILL)
+                except Exception: pass
+            log_event('recording_recovered', 'Killed orphan arecord process(es) from previous daemon run', pids=killed)
+    except Exception as e:
+        log_event('recording_recovery_error', str(e))
+
+def main():
+    cleanup_orphan_arecord_processes()
+    set_status('idle')
+    threading.Thread(target=tts_worker, daemon=True).start()
+    threading.Thread(target=command_loop, daemon=True).start()
+    threading.Thread(target=recording_watchdog_loop, daemon=True).start()
+    key_loop()
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Runtime state, recordings, logs, secrets
+.env
+*.env
+!/systemd/*.service
+/workspace/
+recordings/
+*.wav
+*.mp3
+*.flac
+*.log
+*.pid
+state.json
+events.jsonl
+commands.jsonl
+conversation.json
+weak_answers.json
+python-tool-workdir/
+
+# Model weights / compiled dependencies
+models/
+*.gguf
+*.bin
+*.onnx
+*.tar.gz
+whisper.cpp/
+llama.cpp/
+piper/
+build/
+dist/
